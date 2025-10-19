@@ -1,48 +1,52 @@
 # -*- coding: utf-8 -*-
 """
-Refactor for LangChain 1.x — Multi-modal RAG
-- Groq (Llama-3.1-70B-versatile) for text/table summarization (sequential with sleep)
-- OpenAI gpt-4o-mini for image understanding (vision)
-- OpenAI text-embedding-3-small for embeddings (Chroma)
-- Reads GROQ_API_KEY, OPENAI_API_KEY from .env
-
-Requirements:
-  pip install -U "unstructured[all-docs]" pillow lxml chromadb tiktoken \
-      langchain langchain-community langchain-openai langchain-groq python-dotenv
-
-Windows OCR:
-  - Tesseract (bắt buộc khi strategy="hi_res")
-  - (Khuyên) Poppler
-
-Place your PDF at ./content/attention.pdf
+LangChain Multi-modal RAG (with cache)
+- Groq for text/table summarization
+- OpenAI gpt-4o-mini for image understanding
+- OpenAI embeddings + Chroma for retrieval
+- Automatic caching for summaries + embeddings
 """
 
-import os
-import time
-import base64
-import uuid
+import os, time, base64, uuid, hashlib, json
 from typing import List, Dict, Any
-
 from dotenv import load_dotenv
-load_dotenv()  # OPENAI_API_KEY, GROQ_API_KEY
 
-# ===================== 1) PDF EXTRACT (unstructured) =====================
+load_dotenv()  # load OPENAI_API_KEY, GROQ_API_KEY
+
+# ===================== 1) PDF EXTRACT =====================
 from unstructured.partition.pdf import partition_pdf
 
 PDF_PATH = "./content/paper1.pdf"
+CACHE_DIR = "./cache"
+CHROMA_PATH = "./chroma_store"
+os.makedirs(CACHE_DIR, exist_ok=True)
+os.makedirs(CHROMA_PATH, exist_ok=True)
 
-# Nếu chưa có OCR, tạm đổi strategy="fast" để chạy không cần Tesseract/Poppler
+def get_file_hash(path):
+    with open(path, "rb") as f:
+        return hashlib.md5(f.read()).hexdigest()
+
+HASH_FILE = os.path.join(CHROMA_PATH, "last_hash.txt")
+pdf_hash = get_file_hash(PDF_PATH)
+need_rebuild = True
+if os.path.exists(HASH_FILE):
+    with open(HASH_FILE) as f:
+        if f.read().strip() == pdf_hash:
+            need_rebuild = False
+print("🔍 PDF changed:", need_rebuild)
+
 chunks = partition_pdf(
     filename=PDF_PATH,
     infer_table_structure=True,
-    strategy="hi_res",                   # "hi_res" cần OCR; có thể đổi "fast" nếu muốn bỏ OCR
-    extract_image_block_types=["Image"], # trích ảnh ra
-    extract_image_block_to_payload=True, # đưa ảnh base64 vào metadata
+    strategy="hi_res",
+    extract_image_block_types=["Image"],
+    extract_image_block_to_payload=True,
     chunking_strategy="by_title",
     max_characters=10000,
     combine_text_under_n_chars=2000,
     new_after_n_chars=6000,
 )
+
 
 tables, texts = [], []
 for ch in chunks:
@@ -52,7 +56,29 @@ for ch in chunks:
     if "CompositeElement" in tname:
         texts.append(ch)
 
-def get_images_base64(all_chunks) -> List[str]:
+import re
+from collections import Counter
+
+# --- Phát hiện & lọc header/footer xuất hiện quá nhiều lần ---
+text_blocks = [el.text.strip() for el in texts if el.text.strip()]
+# Đếm tần suất xuất hiện của các dòng ngắn (<= 50 ký tự)
+short_lines = [t for t in text_blocks if len(t) <= 50]
+freq = Counter(short_lines)
+
+# Lấy các dòng xuất hiện ≥ 3 lần → có khả năng là header/footer
+repeated_headers = {line for line, c in freq.items() if c >= 3}
+
+cleaned_texts = []
+for el in texts:
+    text = el.text.strip()
+    # Bỏ nếu text nằm trong danh sách header/footer
+    if text and text not in repeated_headers:
+        cleaned_texts.append(el)
+
+texts = cleaned_texts
+
+
+def get_images_base64(all_chunks):
     images_b64 = []
     for ch in all_chunks:
         if "CompositeElement" in str(type(ch)):
@@ -61,92 +87,78 @@ def get_images_base64(all_chunks) -> List[str]:
                     images_b64.append(el.metadata.image_base64)
     return images_b64
 
-images: List[str] = get_images_base64(chunks)
+images = get_images_base64(chunks)
 
-# ================= 2) SUMMARIZATION (Groq for text/table) ================
+# ================= 2) SUMMARIZATION =====================
 from langchain_groq import ChatGroq
 from langchain_openai import ChatOpenAI
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 
-# ---- 2.1 Text/Table summarization with Groq (sequential + sleep) ----
 GROQ_TEXT_MODEL = "llama-3.3-70b-versatile"
-TEXT_SLEEP_SECONDS = 3.0   # giảm tốc để né rate limit
+TEXT_SLEEP_SECONDS = 3.0
+VISION_MODEL = "gpt-4o-mini"
+VISION_SLEEP_SECONDS = 3.0
 
-text_llm = ChatGroq(
-    model=GROQ_TEXT_MODEL,
-    groq_api_key=os.getenv("GROQ_API_KEY")
-)
+text_llm = ChatGroq(model=GROQ_TEXT_MODEL, groq_api_key=os.getenv("GROQ_API_KEY"))
+vision_llm = ChatOpenAI(model=VISION_MODEL)
 
 prompt_text = ChatPromptTemplate.from_template(
     """You are an assistant tasked with summarizing tables and text.
-Give a concise, faithful summary of the content below (no preambles, no bullet labels).
+Give a concise, faithful summary of the content below.
 Content:
 {element}"""
 )
 summarize_chain = prompt_text | text_llm | StrOutputParser()
 
-def summarize_sequential(items: List[Any], to_str=lambda x: x, sleep_s: float = 0.0) -> List[str]:
+vision_prompt = ChatPromptTemplate.from_messages([
+    ("user", [
+        {"type": "text", "text": "Describe this image from a research paper."},
+        {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,{image_b64}"}},
+    ]),
+])
+vision_chain = vision_prompt | vision_llm | StrOutputParser()
+
+def summarize_with_cache(items, cache_file, to_str=lambda x: x, sleep_s=0.0):
+    if os.path.exists(cache_file) and not need_rebuild:
+        print(f"📦 Loaded cache {os.path.basename(cache_file)}")
+        return json.load(open(cache_file, encoding="utf-8"))
     out = []
     for i, it in enumerate(items):
         try:
-            summary = summarize_chain.invoke({"element": to_str(it)})
-            out.append(summary)
+            s = summarize_chain.invoke({"element": to_str(it)})
+            out.append(s)
             print(f"✅ Summarized {i+1}/{len(items)}")
-            if sleep_s > 0:
-                time.sleep(sleep_s)
+            time.sleep(sleep_s)
         except Exception as e:
             print(f"⚠️ Skip {i+1}: {e}")
-            # vẫn đẩy phần tử rỗng để giữ chỉ số nếu cần
             out.append("")
+    json.dump(out, open(cache_file, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
     return out
 
-text_summaries: List[str] = summarize_sequential(texts, to_str=lambda x: x.text, sleep_s=TEXT_SLEEP_SECONDS)
-tables_html: List[str] = [tbl.metadata.text_as_html for tbl in tables]
-table_summaries: List[str] = summarize_sequential(tables_html, to_str=lambda x: x, sleep_s=TEXT_SLEEP_SECONDS)
-
-# ---- 2.2 Image summarization with OpenAI vision (gpt-4o-mini) ----
-VISION_MODEL = "gpt-4o-mini"
-VISION_SLEEP_SECONDS = 3   # nhẹ để tránh spam
-
-vision_llm = ChatOpenAI(model=VISION_MODEL)  # needs OPENAI_API_KEY
-
-vision_prompt = ChatPromptTemplate.from_messages(
-    [
-        (
-            "user",
-            [
-                {
-                    "type": "text",
-                    "text": "Describe this image in detail. The image comes from a research paper about Transformers. If a plot appears, mention axes and trends."
-                },
-                {
-                    "type": "image_url",
-                    "image_url": {"url": "data:image/jpeg;base64,{image_b64}"}
-                },
-            ],
-        ),
-    ]
-)
-vision_chain = vision_prompt | vision_llm | StrOutputParser()
-
-def summarize_images(images_b64: List[str], sleep_s: float = 0.0) -> List[str]:
+def summarize_images_with_cache(imgs, cache_file, sleep_s=0.0):
+    if os.path.exists(cache_file) and not need_rebuild:
+        print(f"📦 Loaded image cache {os.path.basename(cache_file)}")
+        return json.load(open(cache_file, encoding="utf-8"))
     outs = []
-    for i, b64 in enumerate(images_b64):
+    for i, b64 in enumerate(imgs):
         try:
             s = vision_chain.invoke({"image_b64": b64})
             outs.append(s)
-            print(f"🖼️ Summarized image {i+1}/{len(images_b64)}")
-            if sleep_s > 0:
-                time.sleep(sleep_s)
+            print(f"🖼️ Summarized image {i+1}/{len(imgs)}")
+            time.sleep(sleep_s)
         except Exception as e:
             print(f"⚠️ Skip image {i+1}: {e}")
             outs.append("")
+    json.dump(outs, open(cache_file, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
     return outs
 
-image_summaries: List[str] = summarize_images(images, sleep_s=VISION_SLEEP_SECONDS)
+text_summaries = summarize_with_cache(texts, f"{CACHE_DIR}/text_summaries.json", to_str=lambda x: x.text, sleep_s=TEXT_SLEEP_SECONDS)
+tables_html = [t.metadata.text_as_html for t in tables]
+table_summaries = summarize_with_cache(tables_html, f"{CACHE_DIR}/table_summaries.json", to_str=lambda x: x, sleep_s=TEXT_SLEEP_SECONDS)
+image_summaries = summarize_images_with_cache(images, f"{CACHE_DIR}/image_summaries.json", sleep_s=VISION_SLEEP_SECONDS)
 
-# ================ 3) VECTORSTORE (OpenAI Embeddings + Chroma) ============
+# ================ 3) VECTORSTORE ================
 from langchain_openai import OpenAIEmbeddings
 from langchain_chroma import Chroma
 from langchain_core.documents import Document
@@ -155,106 +167,73 @@ emb_fn = OpenAIEmbeddings(model="text-embedding-3-small")
 vectorstore = Chroma(
     collection_name="multi_modal_rag",
     embedding_function=emb_fn,
-    persist_directory="./chroma_store"  # để dùng lại giữa các lần chạy
+    persist_directory=CHROMA_PATH
 )
 
-# “Docstore cha” để thay cho MultiVectorRetriever cũ
-DOCSTORE: Dict[str, Any] = {}
-ID_KEY = "doc_id"
+DOCSTORE, ID_KEY = {}, "doc_id"
 
-def _add_group_to_store(originals: List[Any], summaries: List[str]):
-    if not originals:
-        return
+def _add_group_to_store(originals, summaries):
+    if not originals: return
     ids = [str(uuid.uuid4()) for _ in originals]
-    # nạp docs tóm tắt vào vectorDB (metadata trỏ id cha)
-    summary_docs = [
-        Document(page_content=summaries[i] or "", metadata={ID_KEY: ids[i]})
-        for i in range(len(originals))
-    ]
-    if summary_docs:
-        vectorstore.add_documents(summary_docs)
-    # lưu bản gốc (cha) trong dict
+    docs = [Document(page_content=summaries[i] or "", metadata={ID_KEY: ids[i]}) for i in range(len(originals))]
+    if docs:
+        vectorstore.add_documents(docs)
     for k, v in zip(ids, originals):
         DOCSTORE[k] = v
 
-# nạp đủ 3 nhóm
-_add_group_to_store(texts, text_summaries)
-_add_group_to_store(tables, table_summaries)
-_add_group_to_store(images, image_summaries)
+if need_rebuild:
+    print("📗 Rebuilding Chroma store...")
+    _add_group_to_store(texts, text_summaries)
+    _add_group_to_store(tables, table_summaries)
+    _add_group_to_store(images, image_summaries)
+    json.dump(list(DOCSTORE.keys()), open(f"{CACHE_DIR}/docstore_index.json", "w"))
+    open(HASH_FILE, "w").write(pdf_hash)
+else:
+    print("📗 Using existing Chroma (no rebuild)")
 
-def retrieve_parents(query: str, k: int = 6) -> List[Any]:
+def retrieve_parents(query, k=6):
     hits = vectorstore.similarity_search(query, k=k)
-    parents = []
-    for h in hits:
-        pid = h.metadata.get(ID_KEY)
-        if pid in DOCSTORE:
-            parents.append(DOCSTORE[pid])
-    return parents
+    return [DOCSTORE[h.metadata[ID_KEY]] for h in hits if h.metadata.get(ID_KEY) in DOCSTORE]
 
-# ================= 4) RAG chain (text + image) ==========================
+# ================= 4) RAG =================
 from langchain_core.runnables import RunnablePassthrough, RunnableLambda
 from langchain_core.messages import HumanMessage
 
-def split_docs(docs: List[Any]) -> Dict[str, List[Any]]:
-    """Tách base64 images và text/table gốc từ DOCSTORE."""
+def split_docs(docs):
     img_b64, textish = [], []
     for d in docs:
         if isinstance(d, str):
-            # thử decode để chắc là base64 của ảnh
             try:
-                base64.b64decode(d)
-                img_b64.append(d)
-                continue
-            except Exception:
-                pass
+                base64.b64decode(d); img_b64.append(d); continue
+            except: pass
         textish.append(d)
     return {"images": img_b64, "texts": textish}
 
-def build_mm_prompt(kwargs: Dict[str, Any]) -> List[HumanMessage]:
-    ctx = kwargs["context"]
-    question = kwargs["question"]
-
-    # Xây context text
-    context_text = ""
+def build_mm_prompt(kwargs):
+    ctx, q = kwargs["context"], kwargs["question"]
+    ctx_text = ""
     for t in ctx["texts"]:
         txt = getattr(t, "text", None)
-        # Table của unstructured có html
         if not txt:
             meta = getattr(t, "metadata", None)
-            if meta is not None and hasattr(meta, "text_as_html"):
+            if meta and hasattr(meta, "text_as_html"):
                 txt = meta.text_as_html
-        if txt:
-            context_text += f"\n{txt}\n"
-
-    content = [
-        {
-            "type": "text",
-            "text": (
-                "Answer the question strictly using the context below. "
-                "Context may include text, tables (as HTML), and images.\n\n"
-                f"Context:\n{context_text}\n\n"
-                f"Question: {question}"
-            ),
-        }
-    ]
+        if txt: ctx_text += f"\n{txt}\n"
+    content = [{"type": "text", "text": f"Use the context below to answer.\n\n{ctx_text}\n\nQuestion: {q}"}]
     for b64 in ctx["images"]:
         content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}})
     return [HumanMessage(content=content)]
 
-# Dùng OpenAI vision cho bước trả lời cuối cùng (vì có thể có ảnh)
 final_llm = ChatOpenAI(model="gpt-4o-mini")
 
 rag_chain = (
-    {
-        "context": RunnableLambda(lambda x: retrieve_parents(x)) | RunnableLambda(split_docs),
-        "question": RunnablePassthrough(),
-    }
+    {"context": RunnableLambda(lambda x: retrieve_parents(x)) | RunnableLambda(split_docs),
+     "question": RunnablePassthrough()}
     | RunnableLambda(build_mm_prompt)
     | final_llm
     | StrOutputParser()
 )
 
-# Kèm debug context
 rag_chain_with_ctx = {
     "context": RunnableLambda(lambda x: retrieve_parents(x)) | RunnableLambda(split_docs),
     "question": RunnablePassthrough(),
@@ -262,20 +241,18 @@ rag_chain_with_ctx = {
     response=(RunnableLambda(build_mm_prompt) | final_llm | StrOutputParser())
 )
 
-# ================= 5) DEMO ==============================================
+# ================= DEMO =================
 if __name__ == "__main__":
     q1 = "What is pythagorean theorem?"
     print("\nQ:", q1)
     print("A:", rag_chain.invoke(q1))
 
-    q2 = "What is ptolemy's generalization of Pythagorean theorem?"
+    q2 = "What is Ptolemy's generalization of Pythagorean theorem?"
     print("\nQ:", q2)
     out = rag_chain_with_ctx.invoke(q2)
     print("A:", out["response"])
 
-    print("\n--- Context preview (first 2 text items) ---")
+    print("\n--- Context preview ---")
     for t in out["context"]["texts"][:2]:
-        try:
-            print((getattr(t, "text", "") or "")[:400], "\n-----")
-        except Exception:
-            pass
+        try: print((getattr(t, "text", "") or "")[:400], "\n-----")
+        except: pass
