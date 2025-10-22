@@ -12,6 +12,8 @@ env/
 
 # Chroma vector store
 chroma_store/
+content/
+cache/
 
 # Environment variables
 .env

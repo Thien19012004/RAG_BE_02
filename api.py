@@ -7,8 +7,9 @@ FastAPI application for RAG system
 
 import os
 import shutil
-from typing import Optional
+from typing import Optional, Dict, Tuple
 from pathlib import Path
+import uuid
 
 from fastapi import FastAPI, File, UploadFile, HTTPException, Form
 from fastapi.responses import JSONResponse
@@ -20,12 +21,46 @@ from langchain_multimodal import _build_pipeline
 
 app = FastAPI(title="RAG PDF API", version="1.0.0")
 
-# Global variables to store the RAG pipeline
-rag_chain = None
-rag_chain_with_ctx = None
+# In-memory store: file_id -> (rag_chain, rag_chain_with_ctx)
+pipelines: Dict[str, Tuple[object, object]] = {}
+
+
+def _paths_for(file_id: str) -> Dict[str, str]:
+    base_content = os.path.join("./content", f"{file_id}.pdf")
+    base_cache = os.path.join("./cache", file_id)
+    base_chroma = os.path.join("./chroma_store", file_id)
+    base_hash = os.path.join(base_chroma, "last_hash.txt")
+    return {
+        "pdf_path": base_content,
+        "cache_dir": base_cache,
+        "chroma_path": base_chroma,
+        "hash_file": base_hash,
+    }
+
+
+def _set_config_paths_for(file_id: str) -> Dict[str, str]:
+    """Temporarily point config paths to per-file directories for building."""
+    from importlib import reload
+    import config as cfg
+
+    paths = _paths_for(file_id)
+
+    # Ensure directories exist
+    os.makedirs(os.path.dirname(paths["pdf_path"]), exist_ok=True)
+    os.makedirs(paths["cache_dir"], exist_ok=True)
+    os.makedirs(paths["chroma_path"], exist_ok=True)
+
+    # Monkey-patch paths in config for this build
+    cfg.PDF_PATH = paths["pdf_path"]
+    cfg.CACHE_DIR = paths["cache_dir"]
+    cfg.CHROMA_PATH = paths["chroma_path"]
+    cfg.HASH_FILE = paths["hash_file"]
+
+    return paths
 
 
 class QueryRequest(BaseModel):
+    file_id: str
     question: str
     include_context: bool = False
 
@@ -37,18 +72,8 @@ class QueryResponse(BaseModel):
 
 @app.on_event("startup")
 async def startup_event():
-    """Initialize the RAG pipeline on startup if PDF exists"""
-    global rag_chain, rag_chain_with_ctx
-    try:
-        if os.path.exists(PDF_PATH):
-            print("🚀 Initializing RAG pipeline...")
-            rag_chain, rag_chain_with_ctx = _build_pipeline()
-            print("✅ RAG pipeline initialized successfully")
-        else:
-            print("⚠️ No PDF found. Please upload a PDF first.")
-    except Exception as e:
-        print(f"❌ Failed to initialize RAG pipeline: {e}")
-        # Don't raise - let the API start without pipeline
+    """No-op startup. Pipelines are built per upload."""
+    print("ℹ️ API started. Upload a PDF to build a pipeline.")
 
 
 @app.get("/")
@@ -58,35 +83,34 @@ async def root():
 
 
 @app.post("/upload")
-async def upload_pdf(file: UploadFile = File(...)):
+async def upload_pdf(file: UploadFile = File(...), file_id: Optional[str] = Form(default=None)):
     """
-    Upload a PDF file and rebuild the RAG pipeline
+    Upload a PDF file, build its pipeline, and attach to a file_id
     """
     if not file.filename.lower().endswith('.pdf'):
         raise HTTPException(status_code=400, detail="Only PDF files are allowed")
     
     try:
-        # Save uploaded file
-        with open(PDF_PATH, "wb") as buffer:
+        # Resolve or generate file_id
+        fid = file_id or str(uuid.uuid4())
+
+        # Point config paths to this file_id
+        paths = _set_config_paths_for(fid)
+
+        # Save uploaded file to per-file path
+        with open(paths["pdf_path"], "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
         
-        # Clear existing cache and vectorstore to force rebuild
-        if os.path.exists(CACHE_DIR):
-            shutil.rmtree(CACHE_DIR)
-        if os.path.exists(CHROMA_PATH):
-            shutil.rmtree(CHROMA_PATH)
-        
-        # Recreate directories
-        os.makedirs(CACHE_DIR, exist_ok=True)
-        os.makedirs(CHROMA_PATH, exist_ok=True)
-        
-        # Rebuild pipeline with new PDF
-        global rag_chain, rag_chain_with_ctx
+        # Rebuild pipeline for this file_id
         rag_chain, rag_chain_with_ctx = _build_pipeline()
+
+        # Attach to memory store
+        pipelines[fid] = (rag_chain, rag_chain_with_ctx)
         
         return {
             "message": "PDF uploaded and processed successfully",
             "filename": file.filename,
+            "file_id": fid,
             "status": "success"
         }
         
@@ -97,12 +121,13 @@ async def upload_pdf(file: UploadFile = File(...)):
 @app.post("/query", response_model=QueryResponse)
 async def query_pdf(request: QueryRequest):
     """
-    Query the uploaded PDF using RAG pipeline
+    Query a specific uploaded PDF (by file_id) using its pipeline
     """
-    if rag_chain is None or rag_chain_with_ctx is None:
-        raise HTTPException(status_code=500, detail="RAG pipeline not initialized. Please upload a PDF first.")
+    if request.file_id not in pipelines:
+        raise HTTPException(status_code=404, detail="Unknown file_id. Please upload and use the returned file_id.")
     
     try:
+        rag_chain, rag_chain_with_ctx = pipelines[request.file_id]
         if request.include_context:
             # Use chain that returns context
             result = rag_chain_with_ctx.invoke(request.question)
@@ -134,16 +159,20 @@ async def query_pdf(request: QueryRequest):
 @app.get("/status")
 async def get_status():
     """Get current status of the system"""
-    pdf_exists = os.path.exists(PDF_PATH)
-    cache_exists = os.path.exists(CACHE_DIR)
-    vectorstore_exists = os.path.exists(CHROMA_PATH)
-    
+    # Report known pipelines and their paths
+    known = []
+    for fid in pipelines.keys():
+        p = _paths_for(fid)
+        known.append({
+            "file_id": fid,
+            "pdf_path": p["pdf_path"],
+            "cache_dir": p["cache_dir"],
+            "chroma_path": p["chroma_path"],
+        })
+
     return {
-        "pdf_uploaded": pdf_exists,
-        "cache_exists": cache_exists,
-        "vectorstore_exists": vectorstore_exists,
-        "pipeline_ready": rag_chain is not None and rag_chain_with_ctx is not None,
-        "pdf_path": PDF_PATH if pdf_exists else None
+        "pipelines": known,
+        "count": len(known),
     }
 
 

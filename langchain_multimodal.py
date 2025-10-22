@@ -7,12 +7,8 @@ LangChain Multi-modal RAG (with cache)
 - Automatic caching for summaries + embeddings
 """
 
-from config import (
-    PDF_PATH,
-    CACHE_DIR,
-    HASH_FILE,
-    compute_rebuild_flag,
-)
+import config as cfg
+
 from pdf_extract import (
     partition_pdf_into_chunks,
     split_tables_and_texts,
@@ -37,10 +33,10 @@ from rag_pipeline import build_rag_chains
 
 
 def _build_pipeline():
-    need_rebuild, pdf_hash = compute_rebuild_flag(PDF_PATH, HASH_FILE)
+    need_rebuild, pdf_hash = cfg.compute_rebuild_flag(cfg.PDF_PATH, cfg.HASH_FILE)
     print("🔍 PDF changed:", need_rebuild)
 
-    chunks = partition_pdf_into_chunks(PDF_PATH)
+    chunks = partition_pdf_into_chunks(cfg.PDF_PATH)
     #print(chunks)
     tables, texts = split_tables_and_texts(chunks)
     #print(tables)
@@ -55,7 +51,7 @@ def _build_pipeline():
 
     text_summaries = summarize_with_cache(
         texts,
-        f"{CACHE_DIR}/text_summaries.json",
+        f"{cfg.CACHE_DIR}/text_summaries.json",
         text_summarizer,
         to_str=lambda x: x.text,
         sleep_s=TEXT_SLEEP_SECONDS,
@@ -65,7 +61,7 @@ def _build_pipeline():
     #print(tables_html)
     table_summaries = summarize_with_cache(
         tables_html,
-        f"{CACHE_DIR}/table_summaries.json",
+        f"{cfg.CACHE_DIR}/table_summaries.json",
         text_summarizer,
         to_str=lambda x: x,
         sleep_s=TEXT_SLEEP_SECONDS,
@@ -73,7 +69,7 @@ def _build_pipeline():
     )
     image_summaries = summarize_images_with_cache(
         images,
-        f"{CACHE_DIR}/image_summaries.json",
+        f"{cfg.CACHE_DIR}/image_summaries.json",
         vision_summarizer,
         sleep_s=VISION_SLEEP_SECONDS,
         use_cache=not need_rebuild,
@@ -86,7 +82,7 @@ def _build_pipeline():
         add_group_to_store(vectorstore, docstore, tables, table_summaries)
         add_group_to_store(vectorstore, docstore, images, image_summaries)
         persist_docstore_index(docstore)
-        open(HASH_FILE, "w").write(pdf_hash)
+        open(cfg.HASH_FILE, "w").write(pdf_hash)
     else:
         print("📗 Using existing Chroma (no rebuild)")
 
