@@ -7,4 +7,8 @@ langchain
 langchain-community
 langchain-openai
 langchain-groq
+langchain-chroma
 python-dotenv
+fastapi
+uvicorn
+python-multipart
