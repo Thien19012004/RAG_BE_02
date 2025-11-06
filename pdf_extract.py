@@ -3,10 +3,9 @@ from typing import Any, List, Tuple
 
 from unstructured.partition.pdf import partition_pdf
 
-from config import PDF_PATH
 
-
-def partition_pdf_into_chunks(pdf_path: str = PDF_PATH):
+def partition_pdf_into_chunks(pdf_path: str):
+    """Partition PDF into chunks using unstructured with optimized settings"""
     return partition_pdf(
         filename=pdf_path,
         infer_table_structure=True,
@@ -14,13 +13,14 @@ def partition_pdf_into_chunks(pdf_path: str = PDF_PATH):
         extract_image_block_types=["Image"],
         extract_image_block_to_payload=True,
         chunking_strategy="by_title",
-        max_characters=10000,
-        combine_text_under_n_chars=2000,
-        new_after_n_chars=6000,
+        max_characters=8000,  # Reduced from 10000 for faster processing
+        combine_text_under_n_chars=1500,  # Reduced from 2000
+        new_after_n_chars=4000,  # Reduced from 6000
     )
 
 
 def split_tables_and_texts(chunks: List[Any]) -> Tuple[List[Any], List[Any]]:
+    """Split chunks into tables and texts"""
     tables, texts = [], []
     for ch in chunks:
         tname = str(type(ch))
@@ -32,6 +32,7 @@ def split_tables_and_texts(chunks: List[Any]) -> Tuple[List[Any], List[Any]]:
 
 
 def remove_repeated_headers(texts: List[Any]) -> List[Any]:
+    """Remove repeated headers from text chunks"""
     text_blocks = [el.text.strip() for el in texts if el.text and el.text.strip()]
     short_lines = [t for t in text_blocks if len(t) <= 50]
     freq = Counter(short_lines)
@@ -46,6 +47,7 @@ def remove_repeated_headers(texts: List[Any]) -> List[Any]:
 
 
 def get_images_base64(all_chunks: List[Any]) -> List[str]:
+    """Extract base64 encoded images from chunks"""
     images_b64: List[str] = []
     for ch in all_chunks:
         if "CompositeElement" in str(type(ch)):

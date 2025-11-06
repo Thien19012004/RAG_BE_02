@@ -5,58 +5,37 @@ FastAPI application for RAG system
 - Query endpoint with RAG pipeline
 """
 
-import os
 import shutil
 from typing import Optional, Dict, Tuple
-from pathlib import Path
 import uuid
-
-from fastapi import FastAPI, File, UploadFile, HTTPException, Form
-from fastapi.responses import JSONResponse
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi import FastAPI, File, UploadFile, HTTPException, Form, BackgroundTasks
 from pydantic import BaseModel
 
-from config import PDF_PATH, CACHE_DIR, CHROMA_PATH, HASH_FILE
-from langchain_multimodal import _build_pipeline
+from config import FileConfig
+from langchain_multimodal import build_pipeline
 
 
 app = FastAPI(title="RAG PDF API", version="1.0.0")
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173"],   # hoặc ['http://localhost:3000']
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 # In-memory store: file_id -> (rag_chain, rag_chain_with_ctx)
 pipelines: Dict[str, Tuple[object, object]] = {}
 
+# Processing status tracking
+processing_status: Dict[str, str] = {}  # file_id -> status
 
-def _paths_for(file_id: str) -> Dict[str, str]:
-    base_content = os.path.join("./content", f"{file_id}.pdf")
-    base_cache = os.path.join("./cache", file_id)
-    base_chroma = os.path.join("./chroma_store", file_id)
-    base_hash = os.path.join(base_chroma, "last_hash.txt")
-    return {
-        "pdf_path": base_content,
-        "cache_dir": base_cache,
-        "chroma_path": base_chroma,
-        "hash_file": base_hash,
-    }
-
-
-def _set_config_paths_for(file_id: str) -> Dict[str, str]:
-    """Temporarily point config paths to per-file directories for building."""
-    from importlib import reload
-    import config as cfg
-
-    paths = _paths_for(file_id)
-
-    # Ensure directories exist
-    os.makedirs(os.path.dirname(paths["pdf_path"]), exist_ok=True)
-    os.makedirs(paths["cache_dir"], exist_ok=True)
-    os.makedirs(paths["chroma_path"], exist_ok=True)
-
-    # Monkey-patch paths in config for this build
-    cfg.PDF_PATH = paths["pdf_path"]
-    cfg.CACHE_DIR = paths["cache_dir"]
-    cfg.CHROMA_PATH = paths["chroma_path"]
-    cfg.HASH_FILE = paths["hash_file"]
-
-    return paths
+# Thread pool for background processing
+executor = ThreadPoolExecutor(max_workers=2)
 
 
 class QueryRequest(BaseModel):
@@ -68,6 +47,14 @@ class QueryRequest(BaseModel):
 class QueryResponse(BaseModel):
     answer: str
     context: Optional[dict] = None
+
+
+class UploadResponse(BaseModel):
+    message: str
+    filename: str
+    file_id: str
+    status: str
+    processing_time: Optional[float] = None
 
 
 @app.on_event("startup")
@@ -82,40 +69,61 @@ async def root():
     return {"message": "RAG PDF API is running", "status": "healthy"}
 
 
-@app.post("/upload")
-async def upload_pdf(file: UploadFile = File(...), file_id: Optional[str] = Form(default=None)):
+def build_pipeline_sync(file_config):
+    """Synchronous pipeline building for background processing"""
+    try:
+        processing_status[file_config.file_id] = "processing"
+        rag_chain, rag_chain_with_ctx = build_pipeline(file_config)
+        pipelines[file_config.file_id] = (rag_chain, rag_chain_with_ctx)
+        processing_status[file_config.file_id] = "completed"
+        return True
+    except Exception as e:
+        processing_status[file_config.file_id] = f"error: {str(e)}"
+        return False
+
+
+@app.post("/upload", response_model=UploadResponse)
+async def upload_pdf(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...), 
+    file_id: Optional[str] = Form(default=None)
+):
     """
-    Upload a PDF file, build its pipeline, and attach to a file_id
+    Upload a PDF file and process it asynchronously for better performance
     """
     if not file.filename.lower().endswith('.pdf'):
         raise HTTPException(status_code=400, detail="Only PDF files are allowed")
     
     try:
+        import time
+        start_time = time.time()
+        
         # Resolve or generate file_id
         fid = file_id or str(uuid.uuid4())
-
-        # Point config paths to this file_id
-        paths = _set_config_paths_for(fid)
-
-        # Save uploaded file to per-file path
-        with open(paths["pdf_path"], "wb") as buffer:
+        
+        # Create file config
+        file_config = FileConfig(fid)
+        
+        # Save uploaded file
+        with open(file_config.pdf_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
         
-        # Rebuild pipeline for this file_id
-        rag_chain, rag_chain_with_ctx = _build_pipeline()
-
-        # Attach to memory store
-        pipelines[fid] = (rag_chain, rag_chain_with_ctx)
+        # Start background processing
+        processing_status[fid] = "queued"
+        background_tasks.add_task(build_pipeline_sync, file_config)
         
-        return {
-            "message": "PDF uploaded and processed successfully",
-            "filename": file.filename,
-            "file_id": fid,
-            "status": "success"
-        }
+        processing_time = time.time() - start_time
+        
+        return UploadResponse(
+            message="PDF uploaded successfully. Processing in background.",
+            filename=file.filename,
+            file_id=fid,
+            status="processing",
+            processing_time=processing_time
+        )
         
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error processing PDF: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error uploading PDF: {str(e)}")
 
 
 @app.post("/query", response_model=QueryResponse)
@@ -123,11 +131,23 @@ async def query_pdf(request: QueryRequest):
     """
     Query a specific uploaded PDF (by file_id) using its pipeline
     """
+    # Check if file is still processing
+    if request.file_id in processing_status:
+        status = processing_status[request.file_id]
+        if status.startswith("processing") or status.startswith("queued"):
+            raise HTTPException(
+                status_code=202, 
+                detail=f"File is still processing. Status: {status}"
+            )
+        elif status.startswith("error"):
+            raise HTTPException(status_code=500, detail=f"Processing failed: {status}")
+    
     if request.file_id not in pipelines:
         raise HTTPException(status_code=404, detail="Unknown file_id. Please upload and use the returned file_id.")
     
     try:
         rag_chain, rag_chain_with_ctx = pipelines[request.file_id]
+        
         if request.include_context:
             # Use chain that returns context
             result = rag_chain_with_ctx.invoke(request.question)
@@ -159,20 +179,39 @@ async def query_pdf(request: QueryRequest):
 @app.get("/status")
 async def get_status():
     """Get current status of the system"""
-    # Report known pipelines and their paths
     known = []
     for fid in pipelines.keys():
-        p = _paths_for(fid)
+        file_config = FileConfig(fid)
+        status = processing_status.get(fid, "completed")
         known.append({
             "file_id": fid,
-            "pdf_path": p["pdf_path"],
-            "cache_dir": p["cache_dir"],
-            "chroma_path": p["chroma_path"],
+            "pdf_path": str(file_config.pdf_path),
+            "cache_dir": str(file_config.cache_dir),
+            "chroma_path": str(file_config.chroma_path),
+            "status": status,
         })
 
     return {
         "pipelines": known,
         "count": len(known),
+        "processing_status": processing_status,
+    }
+
+
+@app.get("/status/{file_id}")
+async def get_file_status(file_id: str):
+    """Get processing status for a specific file"""
+    if file_id not in processing_status and file_id not in pipelines:
+        raise HTTPException(status_code=404, detail="File not found")
+    
+    status = processing_status.get(file_id, "completed")
+    is_ready = file_id in pipelines
+    
+    return {
+        "file_id": file_id,
+        "status": status,
+        "ready": is_ready,
+        "can_query": is_ready and not status.startswith("error")
     }
 
 

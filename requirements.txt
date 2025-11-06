@@ -1,4 +1,5 @@
 unstructured[all-docs]
+unstructured-inference
 pillow
 lxml
 chromadb
@@ -10,5 +11,8 @@ langchain-groq
 langchain-chroma
 python-dotenv
 fastapi
-uvicorn
+uvicorn[standard]
 python-multipart
+pydantic
+aiofiles
+asyncio-throttle

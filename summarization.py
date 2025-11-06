@@ -1,4 +1,6 @@
-import json, os, time
+import json
+import os
+import time
 from typing import Any, Callable, List
 
 from langchain_core.output_parsers import StrOutputParser
@@ -6,16 +8,15 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_groq import ChatGroq
 from langchain_openai import ChatOpenAI
 
-from config import CACHE_DIR
-
 
 GROQ_TEXT_MODEL = "llama-3.3-70b-versatile"
-TEXT_SLEEP_SECONDS = 3.0
+TEXT_SLEEP_SECONDS = 0.5  # Reduced from 3.0 for faster processing
 VISION_MODEL = "gpt-4o-mini"
-VISION_SLEEP_SECONDS = 3.0
+VISION_SLEEP_SECONDS = 0.5  # Reduced from 3.0 for faster processing
 
 
 def build_text_summarizer():
+    """Build text summarizer using Groq"""
     text_llm = ChatGroq(model=GROQ_TEXT_MODEL)
     prompt_text = ChatPromptTemplate.from_template(
         """You are an assistant tasked with summarizing tables and text.
@@ -31,6 +32,7 @@ def build_text_summarizer():
 
 
 def build_vision_summarizer():
+    """Build vision summarizer using OpenAI"""
     vision_llm = ChatOpenAI(model=VISION_MODEL)
     vision_prompt = ChatPromptTemplate.from_messages([
         (
@@ -52,17 +54,72 @@ def summarize_with_cache(
     sleep_s: float = 0.0,
     use_cache: bool = True,
 ):
+    """Summarize items with caching and better error handling"""
     if use_cache and os.path.exists(cache_file):
-        return json.load(open(cache_file, encoding="utf-8"))
+        cached_summaries = json.load(open(cache_file, encoding="utf-8"))
+        print(f"📁 Loaded {len(cached_summaries)} cached summaries from {cache_file}")
+        return cached_summaries
+    
+    print(f"🔄 Summarizing {len(items)} items...")
     out: List[str] = []
+    failed_count = 0
+    skipped_count = 0
+    
     for i, it in enumerate(items):
         try:
-            s = summarize_chain.invoke({"element": to_str(it)})
-            out.append(s)
+            # Convert item to string for summarization
+            item_text = to_str(it)
+            
+            # Skip empty, None, or very short items
+            if not item_text or not isinstance(item_text, str) or len(item_text.strip()) < 20:
+                print(f"⚠️ Skipping item {i}: too short or empty ({len(item_text) if item_text else 0} chars)")
+                out.append("")
+                skipped_count += 1
+                continue
+            
+            # Skip items that are too long (might cause API issues)
+            if len(item_text) > 8000:
+                print(f"⚠️ Skipping item {i}: too long ({len(item_text)} chars)")
+                out.append("")
+                skipped_count += 1
+                continue
+            
+            print(f"📝 Summarizing item {i+1}/{len(items)} (length: {len(item_text)})")
+            
+            # Add retry logic for API calls
+            max_retries = 3
+            for retry in range(max_retries):
+                try:
+                    s = summarize_chain.invoke({"element": item_text})
+                    break
+                except Exception as retry_e:
+                    if retry == max_retries - 1:
+                        raise retry_e
+                    print(f"⚠️ Retry {retry + 1}/{max_retries} for item {i+1}: {str(retry_e)}")
+                    time.sleep(sleep_s * 2)  # Longer sleep on retry
+            
+            # Check if summary is valid
+            if s and isinstance(s, str) and len(s.strip()) > 10:
+                out.append(s.strip())
+                print(f"✅ Item {i+1} summarized successfully ({len(s.strip())} chars)")
+            else:
+                print(f"⚠️ Item {i+1} produced invalid summary: '{s}'")
+                out.append("")
+                failed_count += 1
+                
             time.sleep(sleep_s)
-        except Exception:
+            
+        except Exception as e:
+            print(f"❌ Failed to summarize item {i+1}: {str(e)}")
             out.append("")
+            failed_count += 1
+    
+    print(f"📊 Summary complete: {len(out)} total, {failed_count} failed, {skipped_count} skipped")
+    
+    # Save to cache
     json.dump(out, open(cache_file, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
+    print(f"💾 Saved summaries to {cache_file}")
+    
     return out
 
 
@@ -73,17 +130,49 @@ def summarize_images_with_cache(
     sleep_s: float = 0.0,
     use_cache: bool = True,
 ):
+    """Summarize images with caching"""
     if use_cache and os.path.exists(cache_file):
-        return json.load(open(cache_file, encoding="utf-8"))
+        cached_summaries = json.load(open(cache_file, encoding="utf-8"))
+        print(f"📁 Loaded {len(cached_summaries)} cached image summaries from {cache_file}")
+        return cached_summaries
+    
+    print(f"🔄 Summarizing {len(imgs)} images...")
     outs: List[str] = []
-    for b64 in imgs:
+    failed_count = 0
+    
+    for i, b64 in enumerate(imgs):
         try:
+            # Validate base64 image
+            if not b64 or len(b64) < 100:
+                print(f"⚠️ Skipping image {i}: invalid base64")
+                outs.append("")
+                continue
+            
+            print(f"🖼️ Summarizing image {i+1}/{len(imgs)} (size: {len(b64)} chars)")
             s = vision_chain.invoke({"image_b64": b64})
-            outs.append(s)
+            
+            # Check if summary is valid
+            if s and len(s.strip()) > 0:
+                outs.append(s.strip())
+                print(f"✅ Image {i+1} summarized successfully")
+            else:
+                print(f"⚠️ Image {i+1} produced empty summary")
+                outs.append("")
+                failed_count += 1
+                
             time.sleep(sleep_s)
-        except Exception:
+            
+        except Exception as e:
+            print(f"❌ Failed to summarize image {i+1}: {str(e)}")
             outs.append("")
+            failed_count += 1
+    
+    print(f"📊 Image summary complete: {len(outs)} total, {failed_count} failed")
+    
+    # Save to cache
     json.dump(outs, open(cache_file, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
+    print(f"💾 Saved image summaries to {cache_file}")
+    
     return outs
 
 
