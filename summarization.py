@@ -46,6 +46,60 @@ def build_vision_summarizer():
     return vision_prompt | vision_llm | StrOutputParser()
 
 
+def build_region_explainer():
+    """Build a region explainer specialized for math formulas, tables, and figures."""
+    vision_llm = ChatOpenAI(model=VISION_MODEL)
+    prompt_text = ChatPromptTemplate.from_messages([
+        (
+            "system",
+            "You are an expert scientific assistant. Analyze a cropped region from a research paper. "
+            "Determine if it is a math formula, a table, a figure/plot, or text. "
+            "Then explain it clearly and concisely for a student audience. "
+            "If it is a formula: explain the meaning of symbols, each term, and how the expression is used; if possible, outline steps or intuition. "
+            "If it is a table: describe columns/rows, units, key trends, and notable comparisons. "
+            "If it is a plot/figure: describe axes, units, variables, and the main relationship/insight. "
+            "If it is text: summarize the key point. "
+            "Avoid hallucination; if uncertain, say what is unclear."
+        ),
+        (
+            "user",
+            [
+                {"type": "text", "text": "Please analyze and explain this cropped region."},
+                {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,{image_b64}"}},
+            ],
+        )
+    ])
+    return prompt_text | vision_llm | StrOutputParser()
+
+
+def build_region_explainer_hybrid():
+    """Build hybrid explainer that uses both the cropped image and optional textual context from the paper."""
+    vision_llm = ChatOpenAI(model=VISION_MODEL)
+    prompt = ChatPromptTemplate.from_messages([
+        (
+            "system",
+            "You are an expert scientific assistant. Analyze a cropped region from a research paper. "
+            "You are also given textual context (summaries of related parts of the same paper). "
+            "First, identify whether the region is a math formula, table, figure/plot, or text. "
+            "Then produce a clear explanation for a student: "
+            "- For formulas: define symbols, explain terms, and provide intuition/derivation outline if possible.\n"
+            "- For tables: describe columns/rows, units, trends, comparisons.\n"
+            "- For figures/plots: describe axes, variables, units, and the main relationships/insights.\n"
+            "- For text: summarize the key point.\n"
+            "Use the provided textual context to reduce hallucination; if context contradicts the image, state the uncertainty. "
+            "Cite relevant pieces of the context in-line by short quotes if helpful."
+        ),
+        (
+            "user",
+            [
+                {"type": "text", "text": "Context from the same paper (summarized):\n{context_text}\n\nNow explain the cropped region below."},
+                {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,{image_b64}"}},
+            ],
+        ),
+    ])
+    return prompt | vision_llm | StrOutputParser()
+
+
 def summarize_with_cache(
     items: List[Any],
     cache_file: str,

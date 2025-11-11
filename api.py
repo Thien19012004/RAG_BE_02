@@ -16,6 +16,8 @@ from pydantic import BaseModel
 
 from config import FileConfig
 from langchain_multimodal import build_pipeline
+from summarization import build_region_explainer, build_region_explainer_hybrid
+from vectorstore_setup import build_vectorstore
 
 
 app = FastAPI(title="RAG PDF API", version="1.0.0")
@@ -72,12 +74,15 @@ async def root():
 def build_pipeline_sync(file_config):
     """Synchronous pipeline building for background processing"""
     try:
+        print(f"🟠 [UPLOAD] Begin processing for file_id={file_config.file_id}")
         processing_status[file_config.file_id] = "processing"
         rag_chain, rag_chain_with_ctx = build_pipeline(file_config)
         pipelines[file_config.file_id] = (rag_chain, rag_chain_with_ctx)
         processing_status[file_config.file_id] = "completed"
+        print(f"🟢 [UPLOAD] Completed processing for file_id={file_config.file_id}")
         return True
     except Exception as e:
+        print(f"🔴 [UPLOAD] Error while processing file_id={file_config.file_id}: {str(e)}")
         processing_status[file_config.file_id] = f"error: {str(e)}"
         return False
 
@@ -100,6 +105,7 @@ async def upload_pdf(
         
         # Resolve or generate file_id
         fid = file_id or str(uuid.uuid4())
+        print(f"⬆️  [UPLOAD] Receiving file '{file.filename}' -> file_id={fid}")
         
         # Create file config
         file_config = FileConfig(fid)
@@ -107,9 +113,11 @@ async def upload_pdf(
         # Save uploaded file
         with open(file_config.pdf_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
+        print(f"💾 [UPLOAD] Saved PDF to {file_config.pdf_path}")
         
         # Start background processing
         processing_status[fid] = "queued"
+        print(f"🕓 [UPLOAD] Queued processing for file_id={fid}")
         background_tasks.add_task(build_pipeline_sync, file_config)
         
         processing_time = time.time() - start_time
@@ -123,7 +131,83 @@ async def upload_pdf(
         )
         
     except Exception as e:
+        print(f"🔴 [UPLOAD] Error during upload: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error uploading PDF: {str(e)}")
+
+
+class ExplainRequest(BaseModel):
+    image_b64: str
+    file_id: Optional[str] = None
+    page_number: Optional[int] = None
+    # Optional crop rect (normalized or px from FE if needed later)
+    rect: Optional[dict] = None
+
+
+class ExplainResponse(BaseModel):
+    explanation: str
+
+
+@app.post("/explain-region", response_model=ExplainResponse)
+async def explain_region(req: ExplainRequest):
+    """
+    Explain a cropped region (math formula, table, figure, or text) from base64 image.
+    FE should send base64 data URL payload (only the base64 part is needed).
+    """
+    try:
+        if not req.image_b64 or len(req.image_b64) < 50:
+            raise HTTPException(status_code=400, detail="Invalid image_b64")
+
+        print(f"🟠 [EXPLAIN] Received region for analysis (size={len(req.image_b64)} chars)")
+
+        context_text = ""
+        used_hybrid = False
+
+        # If file_id provided, try to load cached summaries to serve as textual context
+        if req.file_id:
+            try:
+                file_config = FileConfig(req.file_id)
+                cache_text = file_config.cache_dir / "text_summaries.json"
+                cache_table = file_config.cache_dir / "table_summaries.json"
+                cache_image = file_config.cache_dir / "image_summaries.json"
+
+                snippets = []
+                import json
+                if cache_text.exists():
+                    txts = json.load(open(cache_text, encoding="utf-8"))
+                    snippets.extend([t for t in txts if isinstance(t, str) and t.strip()][:8])
+                if cache_table.exists():
+                    tabs = json.load(open(cache_table, encoding="utf-8"))
+                    snippets.extend([t for t in tabs if isinstance(t, str) and t.strip()][:4])
+                if cache_image.exists():
+                    imgs = json.load(open(cache_image, encoding="utf-8"))
+                    snippets.extend([t for t in imgs if isinstance(t, str) and t.strip()][:4])
+
+                # Join and cap length
+                context_text = "\n---\n".join(snippets)
+                if len(context_text) > 4000:
+                    context_text = context_text[:4000] + " ..."
+
+                if context_text.strip():
+                    print(f"📚 [EXPLAIN] Using hybrid context from cache (len={len(context_text)}) for file_id={req.file_id}")
+                    chain = build_region_explainer_hybrid()
+                    explanation = chain.invoke({"image_b64": req.image_b64, "context_text": context_text})
+                    used_hybrid = True
+                else:
+                    print("ℹ️ [EXPLAIN] No non-empty context found in cache; falling back to vision-only")
+            except Exception as ctx_e:
+                print(f"⚠️ [EXPLAIN] Failed to load context for file_id={req.file_id}: {str(ctx_e)}")
+
+        if not used_hybrid:
+            chain = build_region_explainer()
+            explanation = chain.invoke({"image_b64": req.image_b64})
+
+        print("🟢 [EXPLAIN] Explanation generated")
+        return ExplainResponse(explanation=explanation.strip() if explanation else "")
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"🔴 [EXPLAIN] Error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error explaining region: {str(e)}")
 
 
 @app.post("/query", response_model=QueryResponse)
