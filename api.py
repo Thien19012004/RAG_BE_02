@@ -241,7 +241,8 @@ async def query_pdf(request: QueryRequest):
                     "texts": [
                         {
                             "text": getattr(t, "text", "")[:400] if hasattr(t, "text") else "",
-                            "type": type(t).__name__
+                            "type": type(t).__name__,
+                            "page": getattr(getattr(t, "metadata", None), "page_number", None)
                         } 
                         for t in result["context"]["texts"][:3]
                     ],
