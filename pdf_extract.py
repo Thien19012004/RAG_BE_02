@@ -1,12 +1,11 @@
 import os
 import re
-from collections import Counter
+import base64
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, List, Optional, Sequence, Tuple, Dict
-from lxml import etree
 
-from unstructured.partition.pdf import partition_pdf
+from lxml import etree
 
 
 @dataclass
@@ -35,68 +34,52 @@ class SemanticNode:
     text: str
     approx_page_start: Optional[int] = None
     approx_page_end: Optional[int] = None
-    # mới thêm
+    # enriched by attach_layout_to_nodes
     page_number: Optional[int] = None
     bbox: Optional[Dict[str, float]] = None  # raw PDF coords + layout size
 
 
-def partition_pdf_into_chunks(pdf_path: str):
-    """Partition PDF into chunks using unstructured with optimized settings"""
-    return partition_pdf(
-        filename=pdf_path,
-        infer_table_structure=True,
-        strategy="hi_res",
-        extract_image_block_types=["Image"],
-        extract_image_block_to_payload=True,
-        chunking_strategy="by_title",
-        max_characters=8000,  # Reduced from 10000 for faster processing
-        combine_text_under_n_chars=1500,  # Reduced from 2000
-        new_after_n_chars=4000,  # Reduced from 6000
-    )
+# --- New light-weight layout primitives (no unstructured dependency) -----------------
 
 
-def split_tables_and_texts(chunks: List[Any]) -> Tuple[List[Any], List[Any]]:
-    """Split chunks into tables and texts"""
-    tables, texts = [], []
-    for ch in chunks:
-        tname = str(type(ch))
-        if "Table" in tname:
-            tables.append(ch)
-        if "CompositeElement" in tname:
-            texts.append(ch)
-    return tables, texts
+@dataclass
+class LayoutBlock:
+    """Minimal text block with layout information extracted from PyMuPDF."""
+    text: str
+    page_number: int
+    bbox: Dict[str, float]
 
 
-def remove_repeated_headers(texts: List[Any]) -> List[Any]:
-    """Remove repeated headers from text chunks"""
-    text_blocks = [el.text.strip() for el in texts if el.text and el.text.strip()]
-    short_lines = [t for t in text_blocks if len(t) <= 50]
-    freq = Counter(short_lines)
-    repeated_headers = {line for line, c in freq.items() if c >= 3}
-
-    cleaned_texts = []
-    for el in texts:
-        text = (el.text or "").strip()
-        if text and text not in repeated_headers:
-            cleaned_texts.append(el)
-    return cleaned_texts
+@dataclass
+class TableBlock:
+    """Table extracted by Camelot."""
+    html: str
+    plaintext: str
+    page_number: int
+    bbox: Optional[Dict[str, float]] = None
 
 
-def get_images_base64(all_chunks: List[Any]) -> List[str]:
-    """Extract base64 encoded images from chunks"""
-    images_b64: List[str] = []
-    for ch in all_chunks:
-        if "CompositeElement" in str(type(ch)):
-            for el in ch.metadata.orig_elements:
-                if "Image" in str(type(el)):
-                    images_b64.append(el.metadata.image_base64)
-    return images_b64
+@dataclass
+class ImageBlock:
+    """Raw image extracted from PyMuPDF."""
+    image_b64: str
+    page_number: int
+    bbox: Optional[Dict[str, float]] = None
+
+
+# ------------------------------------------------------------------------------------
+#                                GROBID / TEI PARSING
+# ------------------------------------------------------------------------------------
 
 
 def parse_grobid_tei(tei_xml: str, pdf_path: str, paper_id: str) -> GrobidText:
     """
     Parse TEI XML returned by GROBID into a GrobidText object.
     This is a simplified parser: enough to get title, authors, abstract, and sections.
+
+    NOTE: We intentionally *do not* rely on TEI page numbers here. All sections are
+    created with page_start/page_end = None so that attach_layout_to_nodes is free
+    to align them using real PDF layout instead of the placeholder "page 1".
     """
     parser = etree.XMLParser(recover=True)
     root = etree.fromstring(tei_xml.encode("utf-8"), parser=parser)
@@ -114,13 +97,12 @@ def parse_grobid_tei(tei_xml: str, pdf_path: str, paper_id: str) -> GrobidText:
     )
     authors: List[str] = []
     if author_nodes:
-        # Join individual name tokens & deduplicate
         raw = " ".join(a.strip() for a in author_nodes if a.strip())
-        # Rough split by '  ' or ';' or ',' if needed; here we keep as single string
         authors = [raw]
     else:
-        # Fallback: try simpler author extraction
-        simple_authors = root.xpath("//tei:teiHeader//tei:titleStmt//tei:author//text()", namespaces=ns)
+        simple_authors = root.xpath(
+            "//tei:teiHeader//tei:titleStmt//tei:author//text()", namespaces=ns
+        )
         if simple_authors:
             authors = [" ".join(a.strip() for a in simple_authors if a.strip())]
 
@@ -138,7 +120,7 @@ def parse_grobid_tei(tei_xml: str, pdf_path: str, paper_id: str) -> GrobidText:
         head_nodes = div.xpath(".//tei:head//text()", namespaces=ns)
         sec_title = " ".join(h.strip() for h in head_nodes if h.strip()) or f"Section {idx+1}"
 
-        # 💡 GIỮ PARAGRAPH RIÊNG LẺ
+        # paragraphs inside this <div>
         p_elements = div.xpath(".//tei:p", namespaces=ns)
         paragraphs: List[str] = []
         for p in p_elements:
@@ -150,25 +132,20 @@ def parse_grobid_tei(tei_xml: str, pdf_path: str, paper_id: str) -> GrobidText:
         if not paragraphs:
             continue
 
-        # Lưu toàn bộ section.text, nhưng với delimiter giữa paragraphs
         sec_text = "\n\n".join(paragraphs)
-
-        page_start = 1
-        page_end = 1
 
         sections.append(
             GrobidSection(
                 title=sec_title,
                 text=sec_text,
                 order=order_idx,
-                page_start=page_start,
-                page_end=page_end,
+                page_start=None,  # we let layout matching decide later
+                page_end=None,
             )
         )
         order_idx += 1
 
-
-    # Fallback: nếu không parse được section nào, vẫn dùng 1 section full text
+    # Fallback: if no explicit sections, use full body
     if not sections:
         body_nodes = root.xpath("//tei:text//tei:body//text()", namespaces=ns)
         body_text = " ".join(t.strip() for t in body_nodes if t.strip())
@@ -178,12 +155,12 @@ def parse_grobid_tei(tei_xml: str, pdf_path: str, paper_id: str) -> GrobidText:
                     title="Body",
                     text=body_text,
                     order=0,
-                    page_start=1,
-                    page_end=1,
+                    page_start=None,
+                    page_end=None,
                 )
             )
 
-    # Fallback abstract nếu rỗng: dùng đoạn đầu section đầu tiên
+    # Fallback abstract if empty
     if not abstract and sections:
         abstract = sections[0].text[:500]
 
@@ -215,9 +192,7 @@ def run_grobid(pdf_path: str, paper_id: str) -> GrobidText:
             resp.raise_for_status()
             tei_xml = resp.text
 
-            # ✅ Bây giờ chúng ta thực sự parse TEI
             grobid_text = parse_grobid_tei(tei_xml, pdf_path, paper_id)
-            # Nếu parse ra mà sections rỗng → fallback tiếp cho an toàn
             if grobid_text.sections:
                 return grobid_text
             else:
@@ -225,7 +200,6 @@ def run_grobid(pdf_path: str, paper_id: str) -> GrobidText:
         except Exception as exc:  # pragma: no cover - network path best effort
             print(f"⚠️ GROBID call or TEI parsing failed ({exc}); falling back to lightweight parser.")
 
-    # Fallback path: PyMuPDF-based parser
     return _fallback_parse(pdf_path, paper_id)
 
 
@@ -267,6 +241,11 @@ def _fallback_parse(pdf_path: str, paper_id: str) -> GrobidText:
         )
 
 
+# ------------------------------------------------------------------------------------
+#                           SEMANTIC CHUNKING FROM GROBID
+# ------------------------------------------------------------------------------------
+
+
 def build_semantic_nodes(
     paper_id: str,
     sections: List[GrobidSection],
@@ -284,13 +263,11 @@ def build_semantic_nodes(
     """
 
     def split_into_paragraphs(text: str) -> List[str]:
-        # text đã có '\n\n' giữa các paragraph (từ parse_grobid_tei)
         raw_paras = re.split(r"\n\s*\n", text)
         paras = [p.strip() for p in raw_paras if p.strip()]
         return paras
 
     def split_into_sentences(text: str) -> List[str]:
-        # giữ xuống dòng bên trong paragraph (nếu còn), chỉ normalize nhẹ
         text_norm = text.replace("\r", " ").strip()
         if not text_norm:
             return []
@@ -325,7 +302,7 @@ def build_semantic_nodes(
         if not paragraphs:
             continue
 
-        # Optional: merge very short paragraphs với paragraph trước đó
+        # merge very short paragraphs with previous one
         merged_paras: List[str] = []
         for para in paragraphs:
             if not merged_paras:
@@ -334,7 +311,6 @@ def build_semantic_nodes(
 
             prev = merged_paras[-1]
             if estimate_tokens(prev) < para_min_tokens and estimate_tokens(para) < para_min_tokens:
-                # gộp 2 paragraph rất ngắn
                 merged_paras[-1] = prev + " " + para
             else:
                 merged_paras.append(para)
@@ -342,7 +318,7 @@ def build_semantic_nodes(
         for para in merged_paras:
             para_tokens = estimate_tokens(para)
 
-            # 1) Paragraph vừa/nhỏ -> 1 node = cả đoạn
+            # 1) short/medium paragraph → single node
             if para_tokens <= para_max_tokens:
                 nodes.append(
                     SemanticNode(
@@ -357,7 +333,7 @@ def build_semantic_nodes(
                 node_counter += 1
                 continue
 
-            # 2) Paragraph dài -> semantic split theo câu (giống logic cũ, nhưng confined trong paragraph)
+            # 2) long paragraph → semantic split by sentence
             sentences = split_into_sentences(para)
             if not sentences:
                 continue
@@ -380,9 +356,6 @@ def build_semantic_nodes(
                 similarity = cosine_similarity(vec, centroid)
                 length_exceeded = current_token_count + sent_tokens > max_tokens
 
-                # chỉ tách khi:
-                # - quá dài, hoặc
-                # - similarity thấp *và* node đã đủ dài (>= 2 câu)
                 should_split = False
                 if length_exceeded:
                     should_split = True
@@ -425,17 +398,203 @@ def build_semantic_nodes(
     return nodes
 
 
+# ------------------------------------------------------------------------------------
+#                          LAYOUT EXTRACTION (PyMuPDF / Camelot)
+# ------------------------------------------------------------------------------------
+
+
+def extract_layout_blocks(pdf_path: str) -> List[LayoutBlock]:
+    """
+    Extract low-level text blocks and their bounding boxes from the PDF using PyMuPDF.
+
+    This replaces the previous unstructured.partition.pdf based pipeline and is
+    much lighter while still giving us per-block coordinates.
+
+    Coordinates are returned in absolute PDF units together with layout_width /
+    layout_height so the frontend can normalize to [0, 1] as it wishes.
+    """
+    try:
+        import fitz  # type: ignore
+    except Exception as exc:  # pragma: no cover - environment issue
+        print(f"⚠️ PyMuPDF not available for layout extraction ({exc}); no layout blocks.")
+        return []
+
+    blocks: List[LayoutBlock] = []
+    doc = fitz.open(pdf_path)
+    for page_index, page in enumerate(doc):
+        page_number = page_index + 1
+        width, height = page.rect.width, page.rect.height
+
+        for block in page.get_text("blocks"):  # (x0, y0, x1, y1, text, ...)
+            if len(block) < 5:
+                continue
+            x0, y0, x1, y1, text = block[0], block[1], block[2], block[3], block[4]
+            if not text:
+                continue
+            text_clean = text.strip()
+            if not text_clean:
+                continue
+
+            bbox = {
+                "x1": float(x0),
+                "y1": float(y0),
+                "x2": float(x1),
+                "y2": float(y1),
+                "layout_width": float(width),
+                "layout_height": float(height),
+            }
+            # fix y2 value
+            bbox["y2"] = float(y1 if False else y1)  # will be overwritten below
+            bbox["y2"] = float(y1)
+
+            blocks.append(
+                LayoutBlock(
+                    text=text_clean,
+                    page_number=page_number,
+                    bbox=bbox,
+                )
+            )
+
+    # correct typo: y2 must be using original y1/y2
+    for blk in blocks:
+        # in case we ever need to adjust later; kept for safety
+        pass
+
+    return blocks
+
+
+def extract_table_blocks(pdf_path: str) -> List[TableBlock]:
+    """
+    Extract tables using Camelot, if available.
+
+    Even without LLM summarization we can still turn the table into a textual
+    representation (plain text + HTML) so that it can participate in text-only
+    retrieval.
+    """
+    try:
+        import camelot  # type: ignore
+    except Exception as exc:  # pragma: no cover - optional dependency
+        print(f"ℹ️ Camelot not installed or failed to import ({exc}); skipping table extraction.")
+        return []
+
+    try:
+        tables = camelot.read_pdf(
+            pdf_path,
+            pages="all",
+            flavor="lattice",   # good default when PDFs have ruling lines
+            strip_text="\n",
+        )
+    except Exception as exc:  # pragma: no cover - parsing issues
+        print(f"⚠️ Camelot failed to parse tables ({exc}); skipping.")
+        return []
+
+    blocks: List[TableBlock] = []
+    for t in tables:
+        try:
+            page_number = int(getattr(t, "page", None) or t.parsing_report.get("page", 1))
+        except Exception:
+            page_number = 1
+
+        html = t.df.to_html(index=False, border=0)
+        plaintext = t.df.to_string(index=False)
+
+        bbox: Optional[Dict[str, float]] = None
+        try:
+            if hasattr(t, "_bbox") and t._bbox is not None:
+                x1, y1, x2, y2 = t._bbox
+                bbox = {
+                    "x1": float(x1),
+                    "y1": float(y1),
+                    "x2": float(x2),
+                    "y2": float(y2),
+                }
+        except Exception:
+            bbox = None
+
+        blocks.append(
+            TableBlock(
+                html=html,
+                plaintext=plaintext,
+                page_number=page_number,
+                bbox=bbox,
+            )
+        )
+
+    return blocks
+
+
+def extract_image_blocks(pdf_path: str) -> List[ImageBlock]:
+    """
+    Extract images as base64 + bbox using PyMuPDF.
+
+    We still don't *summarize* these images here — they are mainly for front-end
+    display and for the /explain-region multimodal endpoint.
+    """
+    try:
+        import fitz  # type: ignore
+    except Exception as exc:  # pragma: no cover
+        print(f"⚠️ PyMuPDF not available for image extraction ({exc}); no images.")
+        return []
+
+    blocks: List[ImageBlock] = []
+    doc = fitz.open(pdf_path)
+    for page_index, page in enumerate(doc):
+        page_number = page_index + 1
+        width, height = page.rect.width, page.rect.height
+
+        for img in page.get_images(full=True):
+            xref = img[0]
+            try:
+                pix = fitz.Pixmap(doc, xref)
+                if pix.n >= 5:
+                    pix = fitz.Pixmap(fitz.csRGB, pix)
+                img_bytes = pix.tobytes("png")
+                img_b64 = base64.b64encode(img_bytes).decode("ascii")
+
+                rects = page.get_image_rects(xref)
+                bbox: Optional[Dict[str, float]] = None
+                if rects:
+                    r = rects[0]
+                    bbox = {
+                        "x1": float(r.x0),
+                        "y1": float(r.y0),
+                        "x2": float(r.x1),
+                        "y2": float(r.y1),
+                        "layout_width": float(width),
+                        "layout_height": float(height),
+                    }
+
+                blocks.append(
+                    ImageBlock(
+                        image_b64=img_b64,
+                        page_number=page_number,
+                        bbox=bbox,
+                    )
+                )
+            except Exception as exc:
+                print(f"⚠️ Failed to extract image on page {page_number}: {exc}")
+
+    return blocks
+
+
+# ------------------------------------------------------------------------------------
+#                     ALIGN LAYOUT BLOCKS -> SEMANTIC NODES (for highlight)
+# ------------------------------------------------------------------------------------
+
 
 def attach_layout_to_nodes(
     nodes: List[SemanticNode],
     texts: List[Any],
 ) -> List[SemanticNode]:
     """
-    Gắn thông tin layout (page_number + bbox) từ các text chunk của unstructured
-    vào từng SemanticNode.
+    Attach layout info (page_number + bbox) from low-level text blocks to each
+    SemanticNode.
 
-    - page_number: số trang từ unstructured (page_number)
-    - bbox: dict raw toạ độ PDF + kích thước layout để frontend tự convert.
+    - When texts is a list of LayoutBlock (our new PyMuPDF extractor), we use
+      its page_number + bbox directly.
+    - For backwards compatibility, we still support objects having a .metadata
+      with page_number / coordinates (e.g. unstructured elements), but we no
+      longer *depend* on unstructured being installed.
     """
 
     def _norm(s: str) -> List[str]:
@@ -450,6 +609,9 @@ def attach_layout_to_nodes(
         return inter / max(1, len(a_set))
 
     def _extract_page_and_bbox(el: Any) -> Tuple[Optional[int], Optional[Dict[str, float]]]:
+        if isinstance(el, LayoutBlock):
+            return el.page_number, el.bbox
+
         meta = getattr(el, "metadata", None)
         if meta is None:
             return None, None
@@ -463,7 +625,6 @@ def attach_layout_to_nodes(
         bbox_dict: Dict[str, float] = {}
 
         try:
-            # unstructured thường là dataclass có .bounding_box và layout_width/height
             if isinstance(coords, dict):
                 bb = coords.get("bounding_box") or coords
                 x1 = bb.get("x1")
@@ -498,7 +659,6 @@ def attach_layout_to_nodes(
 
         return page, bbox_dict or None
 
-    # Chuẩn bị candidate blocks
     blocks = []
     for el in texts:
         raw_text = getattr(el, "text", "") or ""
@@ -518,17 +678,18 @@ def attach_layout_to_nodes(
             }
         )
 
-    # Align từng node với block tốt nhất (theo word-overlap + gần page)
+    if not blocks:
+        return nodes
+
     for node in nodes:
         node_words = _norm(node.text)
-        if not node_words or not blocks:
+        if not node_words:
             continue
 
         best_score = 0.0
-        best_block = None
+        best_block: Optional[Dict[str, Any]] = None
 
         for blk in blocks:
-            # ưu tiên các block gần approx_page_start
             if node.approx_page_start and blk["page"]:
                 if abs(blk["page"] - node.approx_page_start) > 2:
                     continue
@@ -538,7 +699,6 @@ def attach_layout_to_nodes(
                 best_score = score
                 best_block = blk
 
-        # đặt threshold nhẹ để tránh gán linh tinh
         if best_block and best_score > 0.2:
             node.page_number = best_block["page"] or node.approx_page_start
             if best_block["bbox"]:

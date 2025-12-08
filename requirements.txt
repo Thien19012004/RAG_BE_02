@@ -16,4 +16,6 @@ python-multipart
 pydantic
 aiofiles
 asyncio-throttle
-fitz
+pymupdf
+camelot-py
+opencv-python-headless
