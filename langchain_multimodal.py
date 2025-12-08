@@ -147,7 +147,7 @@ def ingest_document(file_config, backend: VectorStoreBackend) -> IngestionResult
         vision_summarizer,
         use_cache=not need_rebuild,
         batch_size=3,
-        max_workers=2,
+        max_workers=4,
     )
     print(
         "📈 [PIPELINE] Summaries -> "
