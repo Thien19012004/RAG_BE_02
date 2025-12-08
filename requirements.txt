@@ -16,3 +16,4 @@ python-multipart
 pydantic
 aiofiles
 asyncio-throttle
+fitz

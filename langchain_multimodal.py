@@ -1,127 +1,263 @@
 # -*- coding: utf-8 -*-
 """
-LangChain Multi-modal RAG Pipeline
-- Groq for text/table summarization
-- OpenAI gpt-4o-mini for image understanding
-- OpenAI embeddings + Chroma for retrieval
-- Automatic caching for summaries + embeddings
+Document ingestion pipeline responsible for:
+- dual extraction (GROBID text + unstructured layout)
+- multimodal summarization with caching
+- semantic node construction
+- writing abstract/content docs into the configured vector backend
 """
 
+from dataclasses import dataclass
+import json
+from typing import Any, Dict, List
+
+from langchain_core.documents import Document
+
 from pdf_extract import (
-    partition_pdf_into_chunks,
-    split_tables_and_texts,
-    remove_repeated_headers,
+    build_semantic_nodes,
     get_images_base64,
+    partition_pdf_into_chunks,
+    remove_repeated_headers,
+    run_grobid,
+    split_tables_and_texts,
+    attach_layout_to_nodes,  # <- thêm
 )
 from summarization import (
     build_text_summarizer,
     build_vision_summarizer,
-    TEXT_SLEEP_SECONDS,
-    VISION_SLEEP_SECONDS,
 )
 from parallel_processing import process_all_content_parallel
 from vectorstore_setup import (
-    build_vectorstore,
-    add_group_to_store,
-    persist_docstore_index,
-    retrieve_parents as retrieve_parents_vs,
+    ABSTRACT_COLLECTION,
+    CONTENT_COLLECTION,
+    VectorStoreBackend,
+    get_embedding_model,
 )
-from rag_pipeline import build_rag_chains
 
 
-def build_pipeline(file_config):
-    """Build RAG pipeline for a specific file"""
-    print(f"🔧 [PIPELINE] Start building pipeline for file_id={file_config.file_id}")
+@dataclass
+class IngestionResult:
+    paper_id: str
+    title: str
+    abstract: str
+    node_count: int
+    table_count: int
+    image_count: int
+    metadata_path: str
+
+
+def _save_metadata(cache_dir, payload: Dict[str, Any]) -> str:
+    cache_dir.mkdir(exist_ok=True, parents=True)
+    meta_path = cache_dir / "paper_metadata.json"
+    with open(meta_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+    return str(meta_path)
+
+
+def _sanitize_metadata(meta: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Ensure all metadata values are simple JSON / Chroma-compatible types:
+    str, int, float, bool, None, or dict với value đơn giản.
+    Lists và kiểu phức tạp khác sẽ stringify.
+    """
+    cleaned: Dict[str, Any] = {}
+    for k, v in meta.items():
+        if isinstance(v, (str, int, float, bool)) or v is None:
+            cleaned[k] = v
+        elif isinstance(v, dict):
+            # chỉ giữ dict đơn giản (không lồng object / list)
+            simple_dict: Dict[str, Any] = {}
+            for dk, dv in v.items():
+                if isinstance(dv, (str, int, float, bool)) or dv is None:
+                    simple_dict[dk] = dv
+                else:
+                    simple_dict[dk] = str(dv)
+            cleaned[k] = simple_dict
+        elif isinstance(v, (list, tuple, set)):
+            simple_vals = [x for x in v if isinstance(x, (str, int, float, bool))]
+            cleaned[k] = ", ".join(str(x) for x in simple_vals) if simple_vals else None
+        else:
+            cleaned[k] = str(v)
+    return cleaned
+
+
+
+def ingest_document(file_config, backend: VectorStoreBackend) -> IngestionResult:
+    """Ingest a PDF into the abstract/content stores while keeping caches updated."""
+    print(f"🔧 [PIPELINE] Start ingest for paper_id={file_config.file_id}")
     need_rebuild, pdf_hash = file_config.needs_rebuild()
-    print(f"📄 [PIPELINE] PDF hash={pdf_hash[:8]}..., need_rebuild={need_rebuild}")
+    print(f"📄 [PIPELINE] PDF hash={pdf_hash[:8]}, need_rebuild={need_rebuild}")
 
-    # Extract content from PDF
-    print(f"🗂️  [PIPELINE] Partition PDF into chunks: {file_config.pdf_path}")
+    # Dual extraction -----------------------------------------------------
+    grobid_payload = run_grobid(str(file_config.pdf_path), paper_id=file_config.file_id)
+    print(f"🧠 [PIPELINE] GROBID sections={len(grobid_payload.sections)} title={grobid_payload.title}")
+
     chunks = partition_pdf_into_chunks(str(file_config.pdf_path))
-    print(f"🧩 [PIPELINE] Extracted chunks: {len(chunks)}")
     tables, texts = split_tables_and_texts(chunks)
-    print(f"📊 [PIPELINE] Tables={len(tables)}, Texts(before clean)={len(texts)}")
     texts = remove_repeated_headers(texts)
-    print(f"🧹 [PIPELINE] Texts(after header clean)={len(texts)}")
     images = get_images_base64(chunks)
-    print(f"🖼️  [PIPELINE] Images extracted={len(images)}")
+    print(
+        f"🧩 [PIPELINE] Layout chunks -> tables={len(tables)}, texts={len(texts)}, images={len(images)}"
+    )
 
-    # Build summarizers
-    print("🧠 [PIPELINE] Build summarizers (text + vision)")
+    # Semantic nodes ------------------------------------------------------
+    embedding_model = get_embedding_model()
+    nodes = build_semantic_nodes(
+        paper_id=file_config.file_id,
+        sections=grobid_payload.sections,
+        embed_fn=embedding_model.embed_documents,
+    )
+    print(f"🧱 [PIPELINE] Semantic nodes built={len(nodes)}")
+    # 🔍 align với layout để lấy page + bbox
+    nodes = attach_layout_to_nodes(nodes, texts)
+
+    # Summarization -------------------------------------------------------
     text_summarizer = build_text_summarizer()
     vision_summarizer = build_vision_summarizer()
-
-    # Prepare cache files
     cache_files = {
         "text_summaries": str(file_config.cache_dir / "text_summaries.json"),
         "table_summaries": str(file_config.cache_dir / "table_summaries.json"),
         "image_summaries": str(file_config.cache_dir / "image_summaries.json"),
     }
-    print(f"🗃️  [PIPELINE] Cache files: {cache_files}")
-    
-    # Convert tables to HTML
-    tables_html = [t.metadata.text_as_html for t in tables]
-    print(f"🧾 [PIPELINE] Converted tables to HTML: {len(tables_html)}")
-    
-    # Process all content in parallel for better performance
-    print("🚀 [PIPELINE] Start parallel summarization (texts/tables/images)")
     text_summaries, table_summaries, image_summaries = process_all_content_parallel(
         texts,
-        tables_html,
+        [t.metadata.text_as_html for t in tables],
         images,
         cache_files,
         text_summarizer,
         vision_summarizer,
         use_cache=not need_rebuild,
     )
-    print(f"📈 [PIPELINE] Summaries: text={len(text_summaries)}, table={len(table_summaries)}, image={len(image_summaries)}")
+    print(
+        f"📈 [PIPELINE] Summaries -> text={len(text_summaries)}, tables={len(table_summaries)}, images={len(image_summaries)}"
+    )
 
-    # Build vector store
-    print(f"📦 [PIPELINE] Build/Load vector store at {file_config.chroma_path}")
-    vectorstore, docstore = build_vectorstore(str(file_config.chroma_path))
-    
-    if need_rebuild:
-        print("📗 [PIPELINE] Rebuilding Chroma store (adding documents)")
-        add_group_to_store(vectorstore, docstore, texts, text_summaries)
-        add_group_to_store(vectorstore, docstore, tables, table_summaries)
-        add_group_to_store(vectorstore, docstore, images, image_summaries)
-        index_path = str(file_config.cache_dir / "docstore_index.json")
-        persist_docstore_index(docstore, index_path)
-        print(f"💾 [PIPELINE] Persisted docstore index to {index_path}")
-        file_config.save_hash(pdf_hash)
-        print("🔐 [PIPELINE] Saved current PDF hash")
+    # Vector store writes -------------------------------------------------
+    backend.delete_where(CONTENT_COLLECTION, {"paper_id": file_config.file_id})
+    backend.delete_where(ABSTRACT_COLLECTION, {"paper_id": file_config.file_id})
+
+    documents: List[Document] = []
+
+    # Prefer semantic nodes if available; otherwise, fall back to text summaries
+    if nodes:
+        for node in nodes:
+            page_label = (
+                node.page_number
+                or node.approx_page_start
+                or node.approx_page_end
+            )
+            
+            metadata = _sanitize_metadata(
+                {
+                    "paper_id": file_config.file_id,
+                    "section_title": node.section_title,
+                    "modality": "text",
+                    "order_idx": node.order_idx,
+                    "page_label": page_label,
+                    "page_start": node.approx_page_start,
+                    "page_end": node.approx_page_end,
+                    "bbox": node.bbox,  # <- raw PDF bbox + layout_size
+                }
+            )
+            documents.append(Document(page_content=node.text, metadata=metadata))
     else:
-        print("📗 [PIPELINE] Using existing Chroma (no rebuild)")
+        # Fallback path when GROBID sections / semantic nodes are unavailable.
+        print("⚠️ [PIPELINE] No semantic nodes; falling back to text_summaries as retrieval units.")
+        for idx, (orig, summary) in enumerate(zip(texts, text_summaries)):
+            if not summary:
+                continue
+            section_title = getattr(getattr(orig, "metadata", None), "section", None)
+            page_label = getattr(getattr(orig, "metadata", None), "page_number", None)
+            metadata = _sanitize_metadata(
+                {
+                    "paper_id": file_config.file_id,
+                    "section_title": section_title or f"Chunk {idx+1}",
+                    "modality": "text",
+                    "order_idx": idx,
+                    "page_label": page_label,
+                    "page_start": page_label,
+                    "page_end": page_label,
+                }
+            )
+            documents.append(Document(page_content=summary, metadata=metadata))
 
-    # Build retrieval function and RAG chains
-    print("🔎 [PIPELINE] Build retrieval fn and RAG chains")
-    retrieve_fn = lambda q: retrieve_parents_vs(vectorstore, docstore, q, k=6)
-    rag_chain, rag_chain_with_ctx = build_rag_chains(retrieve_fn)
-    print("✅ [PIPELINE] Pipeline build finished")
-    
-    return rag_chain, rag_chain_with_ctx
+    for table, summary in zip(tables, table_summaries):
+        if not summary:
+            continue
+        page_number = getattr(table.metadata, "page_number", None)
+        metadata = _sanitize_metadata(
+            {
+                "paper_id": file_config.file_id,
+                "modality": "table",
+                "section_title": getattr(table.metadata, "section", None),
+                "page_label": page_number,
+                "page_start": page_number,
+                "page_end": page_number,
+                "table_html": table.metadata.text_as_html,
+            }
+        )
+        documents.append(Document(page_content=summary, metadata=metadata))
 
+    for image_b64, summary in zip(images, image_summaries):
+        if not summary:
+            continue
+        metadata = _sanitize_metadata(
+            {
+            "paper_id": file_config.file_id,
+            "modality": "image",
+            "section_title": "Figure",
+            "page_label": None,
+            "image_b64": image_b64,
+            }
+        )
+        documents.append(Document(page_content=summary, metadata=metadata))
 
-# ================= DEMO =================
-if __name__ == "__main__":
-    from config import FileConfig
-    
-    # Demo with a test file
-    file_config = FileConfig("test_file")
-    rag_chain, rag_chain_with_ctx = build_pipeline(file_config)
+    backend.add_documents(documents, CONTENT_COLLECTION)
+    print(f"📦 [PIPELINE] Added {len(documents)} docs to content collection")
 
-    q1 = "What is the main idea of the paper?"
-    print("\nQ:", q1)
-    print("A:", rag_chain.invoke(q1))
+    # Abstract text: prefer GROBID abstract, then first semantic node,
+    # finally fall back to concatenated text summaries.
+    if grobid_payload.abstract:
+        abstract_text = grobid_payload.abstract
+    elif nodes:
+        abstract_text = nodes[0].text
+    else:
+        # Join a few non-empty summaries to approximate an abstract
+        non_empty_summaries = [s for s in text_summaries if isinstance(s, str) and s.strip()]
+        joined = " ".join(non_empty_summaries[:5])
+        abstract_text = joined[:2000]
+    abstract_metadata = _sanitize_metadata(
+        {
+            "paper_id": file_config.file_id,
+            "title": grobid_payload.title,
+            "authors": grobid_payload.authors,
+            "section_title": "Abstract",
+            "modality": "abstract",
+        }
+    )
+    abstract_doc = Document(page_content=abstract_text, metadata=abstract_metadata)
+    backend.add_documents([abstract_doc], ABSTRACT_COLLECTION)
+    print("📚 [PIPELINE] Abstract added to abstract collection")
 
-    q2 = "What are the most frequent words?"
-    print("\nQ:", q2)
-    out = rag_chain_with_ctx.invoke(q2)
-    print("A:", out["response"])
+    file_config.save_hash(pdf_hash)
 
-    print("\n--- Context preview ---")
-    for t in out["context"]["texts"][:2]:
-        try:
-            print((getattr(t, "text", "") or "")[:400], "\n-----")
-        except Exception:
-            pass
+    metadata_payload = {
+        "paper_id": file_config.file_id,
+        "title": grobid_payload.title,
+        "authors": grobid_payload.authors,
+        "abstract": abstract_text,
+        "node_count": len(nodes),
+        "table_count": len(tables),
+        "image_count": len(images),
+    }
+    metadata_path = _save_metadata(file_config.cache_dir, metadata_payload)
+
+    return IngestionResult(
+        paper_id=file_config.file_id,
+        title=grobid_payload.title,
+        abstract=abstract_text,
+        node_count=len(nodes),
+        table_count=len(tables),
+        image_count=len(images),
+        metadata_path=metadata_path,
+    )

@@ -2,53 +2,55 @@
 """
 FastAPI application for RAG system
 - Upload PDF endpoint
-- Query endpoint with RAG pipeline
+- Mode-aware query endpoint (document vs corpus)
 """
 
 import shutil
-from typing import Optional, Dict, Tuple
+from typing import Literal, Optional, Dict, Tuple
 import uuid
-import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi import FastAPI, File, UploadFile, HTTPException, Form, BackgroundTasks
 from pydantic import BaseModel
 
-from config import FileConfig
-from langchain_multimodal import build_pipeline
+from config import FileConfig, CHROMA_DIR
+from langchain_multimodal import ingest_document
 from summarization import build_region_explainer, build_region_explainer_hybrid
-from vectorstore_setup import build_vectorstore
+from vectorstore_setup import build_local_chroma_backend
+from rag_pipeline import build_document_rag, build_corpus_rag, PromptConfig
 
 
-app = FastAPI(title="RAG PDF API", version="1.0.0")
+app = FastAPI(title="RAG PDF API", version="2.0.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173"],   # hoặc ['http://localhost:3000']
+    allow_origins=["http://localhost:5173"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# In-memory store: file_id -> (rag_chain, rag_chain_with_ctx)
-pipelines: Dict[str, Tuple[object, object]] = {}
+# Vector backend shared by document + corpus modes
+VECTOR_BACKEND = build_local_chroma_backend(str(CHROMA_DIR / "global_store"))
 
-# Processing status tracking
-processing_status: Dict[str, str] = {}  # file_id -> status
-
-# Thread pool for background processing
+# In-memory structures ----------------------------------------------------
+pipelines: Dict[str, Dict[str, object]] = {}
+corpus_pipeline: Optional[Tuple[object, object]] = None
+processing_status: Dict[str, str] = {}
 executor = ThreadPoolExecutor(max_workers=2)
 
 
 class QueryRequest(BaseModel):
-    file_id: str
     question: str
+    file_id: Optional[str] = None
+    mode: Optional[Literal["document", "corpus"]] = None
     include_context: bool = False
 
 
 class QueryResponse(BaseModel):
     answer: str
     context: Optional[dict] = None
+    mode: Literal["document", "corpus"]
 
 
 class UploadResponse(BaseModel):
@@ -61,8 +63,7 @@ class UploadResponse(BaseModel):
 
 @app.on_event("startup")
 async def startup_event():
-    """No-op startup. Pipelines are built per upload."""
-    print("ℹ️ API started. Upload a PDF to build a pipeline.")
+    print("ℹ️ API started. Upload PDFs to build document pipelines or use corpus mode.")
 
 
 @app.get("/")
@@ -71,13 +72,26 @@ async def root():
     return {"message": "RAG PDF API is running", "status": "healthy"}
 
 
-def build_pipeline_sync(file_config):
-    """Synchronous pipeline building for background processing"""
+def build_pipeline_sync(file_config: FileConfig):
+    """Synchronous ingestion + document-mode pipeline build used in background tasks."""
     try:
         print(f"🟠 [UPLOAD] Begin processing for file_id={file_config.file_id}")
         processing_status[file_config.file_id] = "processing"
-        rag_chain, rag_chain_with_ctx = build_pipeline(file_config)
-        pipelines[file_config.file_id] = (rag_chain, rag_chain_with_ctx)
+        ingestion_result = ingest_document(file_config, VECTOR_BACKEND)
+        prompt_cfg = PromptConfig(
+            mode="document",
+            paper_id=file_config.file_id,
+            paper_title=ingestion_result.title,
+        )
+        rag_chain, rag_chain_with_ctx = build_document_rag(
+            paper_id=file_config.file_id,
+            backend=VECTOR_BACKEND,
+            prompt_cfg=prompt_cfg,
+        )
+        pipelines[file_config.file_id] = {
+            "chains": (rag_chain, rag_chain_with_ctx),
+            "metadata": ingestion_result,
+        }
         processing_status[file_config.file_id] = "completed"
         print(f"🟢 [UPLOAD] Completed processing for file_id={file_config.file_id}")
         return True
@@ -213,52 +227,55 @@ async def explain_region(req: ExplainRequest):
 @app.post("/query", response_model=QueryResponse)
 async def query_pdf(request: QueryRequest):
     """
-    Query a specific uploaded PDF (by file_id) using its pipeline
+    Mode-aware querying. Defaults to document mode when file_id is provided, otherwise corpus mode.
     """
-    # Check if file is still processing
-    if request.file_id in processing_status:
-        status = processing_status[request.file_id]
-        if status.startswith("processing") or status.startswith("queued"):
-            raise HTTPException(
-                status_code=202, 
-                detail=f"File is still processing. Status: {status}"
-            )
-        elif status.startswith("error"):
+    mode = request.mode or ("document" if request.file_id else "corpus")
+
+    if mode == "document":
+        if not request.file_id:
+            raise HTTPException(status_code=400, detail="file_id required for document mode")
+        status = processing_status.get(request.file_id)
+        if status in {"queued", "processing"}:
+            raise HTTPException(status_code=202, detail=f"File is still processing. Status: {status}")
+        if status and status.startswith("error"):
             raise HTTPException(status_code=500, detail=f"Processing failed: {status}")
-    
-    if request.file_id not in pipelines:
-        raise HTTPException(status_code=404, detail="Unknown file_id. Please upload and use the returned file_id.")
-    
+        if request.file_id not in pipelines:
+            raise HTTPException(status_code=404, detail="Unknown file_id. Please upload first.")
+
+        rag_chain, rag_chain_with_ctx = pipelines[request.file_id]["chains"]
+        try:
+            if request.include_context:
+                result = rag_chain_with_ctx.invoke(request.question)
+                return QueryResponse(
+                    answer=result["response"],
+                    context=result.get("context"),
+                    mode="document",
+                )
+            answer = rag_chain.invoke(request.question)
+            return QueryResponse(answer=answer, mode="document")
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Error processing document query: {str(e)}")
+
+    # Corpus mode ---------------------------------------------------------
+    global corpus_pipeline
+    if corpus_pipeline is None:
+        print("ℹ️ [QUERY] Initializing corpus pipeline lazily")
+        prompt_cfg = PromptConfig(mode="corpus")
+        corpus_pipeline = build_corpus_rag(VECTOR_BACKEND, prompt_cfg=prompt_cfg)
+
+    rag_chain, rag_chain_with_ctx = corpus_pipeline
     try:
-        rag_chain, rag_chain_with_ctx = pipelines[request.file_id]
-        
         if request.include_context:
-            # Use chain that returns context
             result = rag_chain_with_ctx.invoke(request.question)
             return QueryResponse(
                 answer=result["response"],
-                context={
-                    "texts": [
-                        {
-                            "text": getattr(t, "text", "")[:400] if hasattr(t, "text") else "",
-                            "type": type(t).__name__,
-                            "page": getattr(getattr(t, "metadata", None), "page_number", None)
-                        } 
-                        for t in result["context"]["texts"][:3]
-                    ],
-                    "images": [
-                        {"length": len(img), "preview": img[:24] + "..."} 
-                        for img in result["context"]["images"][:3]
-                    ]
-                }
+                context=result.get("context"),
+                mode="corpus",
             )
-        else:
-            # Use simple chain
-            answer = rag_chain.invoke(request.question)
-            return QueryResponse(answer=answer)
-            
+        answer = rag_chain.invoke(request.question)
+        return QueryResponse(answer=answer, mode="corpus")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error processing query: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error processing corpus query: {str(e)}")
 
 
 @app.get("/status")
@@ -272,8 +289,10 @@ async def get_status():
             "file_id": fid,
             "pdf_path": str(file_config.pdf_path),
             "cache_dir": str(file_config.cache_dir),
-            "chroma_path": str(file_config.chroma_path),
+            "vector_backend": "local-chroma",
             "status": status,
+            "title": getattr(pipelines[fid].get("metadata"), "title", None),
+            "mode": "document",
         })
 
     return {
@@ -296,7 +315,8 @@ async def get_file_status(file_id: str):
         "file_id": file_id,
         "status": status,
         "ready": is_ready,
-        "can_query": is_ready and not status.startswith("error")
+        "can_query": is_ready and not status.startswith("error"),
+        "title": getattr(pipelines.get(file_id, {}).get("metadata"), "title", None),
     }
 
 

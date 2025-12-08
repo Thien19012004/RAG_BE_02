@@ -1,76 +1,96 @@
-import json
-import uuid
-from typing import Any, Dict, List, Tuple
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Protocol
 
 from langchain_chroma import Chroma
 from langchain_core.documents import Document
 from langchain_openai import OpenAIEmbeddings
 
 
-ID_KEY = "doc_id"
+DEFAULT_EMBED_MODEL = "text-embedding-3-small"
+ABSTRACT_COLLECTION = "abstract_store"
+CONTENT_COLLECTION = "content_store"
 
 
-def build_vectorstore(chroma_path: str) -> Tuple[Chroma, Dict[str, Any]]:
-    """Build vector store with dynamic path"""
-    emb_fn = OpenAIEmbeddings(model="text-embedding-3-small")
-    vectorstore = Chroma(
-        collection_name="multi_modal_rag",
-        embedding_function=emb_fn,
-        persist_directory=chroma_path,
+class VectorStoreBackend(Protocol):
+    """Minimal interface for vector backends so we can swap implementations easily."""
+
+    def add_documents(self, docs: List[Document], collection: str) -> None:
+        ...
+
+    def similarity_search(
+        self,
+        query: str,
+        k: int,
+        collection: str,
+        where: Optional[Dict[str, Any]] = None,
+    ) -> List[Document]:
+        ...
+
+    def delete_where(self, collection: str, where: Dict[str, Any]) -> None:
+        ...
+
+
+@dataclass
+class BackendInitConfig:
+    """Configuration payload for vector backends."""
+
+    persist_dir: Path
+    embedding_model: str = DEFAULT_EMBED_MODEL
+
+
+class LocalChromaBackend:
+    """Disk-based Chroma backend that satisfies the VectorStoreBackend protocol."""
+
+    def __init__(self, config: BackendInitConfig):
+        self.config = config
+        self.config.persist_dir.mkdir(parents=True, exist_ok=True)
+        self._embedding_fn = OpenAIEmbeddings(model=config.embedding_model)
+        self._stores: Dict[str, Chroma] = {}
+
+    def _get_store(self, collection: str) -> Chroma:
+        if collection not in self._stores:
+            collection_path = self.config.persist_dir / collection
+            collection_path.mkdir(exist_ok=True)
+            self._stores[collection] = Chroma(
+                collection_name=collection,
+                embedding_function=self._embedding_fn,
+                persist_directory=str(collection_path),
+            )
+        return self._stores[collection]
+
+    def add_documents(self, docs: List[Document], collection: str) -> None:
+        if not docs:
+            return
+        store = self._get_store(collection)
+        store.add_documents(docs)
+
+    def similarity_search(
+        self,
+        query: str,
+        k: int,
+        collection: str,
+        where: Optional[Dict[str, Any]] = None,
+    ) -> List[Document]:
+        store = self._get_store(collection)
+        return store.similarity_search(query, k=k, filter=where)
+
+    def delete_where(self, collection: str, where: Dict[str, Any]) -> None:
+        store = self._get_store(collection)
+        store.delete(where=where)
+
+
+def get_embedding_model(model: str = DEFAULT_EMBED_MODEL) -> OpenAIEmbeddings:
+    """Helper to build a shared embedding model instance."""
+    return OpenAIEmbeddings(model=model)
+
+
+def build_local_chroma_backend(base_path: str, model: str = DEFAULT_EMBED_MODEL) -> LocalChromaBackend:
+    """Factory for the default LocalChroma backend."""
+    return LocalChromaBackend(
+        BackendInitConfig(
+            persist_dir=Path(base_path),
+            embedding_model=model,
+        )
     )
-    return vectorstore, {}
-
-
-def add_group_to_store(
-    vectorstore: Chroma,
-    docstore: Dict[str, Any],
-    originals: List[Any],
-    summaries: List[str],
-):
-    """Add a group of documents to the vector store"""
-    if not originals:
-        print("⚠️ No originals to add to store")
-        return
-    
-    if len(originals) != len(summaries):
-        print(f"⚠️ Mismatch: {len(originals)} originals vs {len(summaries)} summaries")
-        return
-    
-    # Filter out empty summaries and their corresponding originals
-    valid_items = []
-    for i, (orig, summary) in enumerate(zip(originals, summaries)):
-        if summary and summary.strip():
-            valid_items.append((orig, summary.strip()))
-        else:
-            print(f"⚠️ Skipping item {i}: empty summary")
-    
-    if not valid_items:
-        print("⚠️ No valid items to add to vector store")
-        return
-    
-    print(f"📚 Adding {len(valid_items)} valid items to vector store")
-    
-    # Create documents for valid items only
-    ids = [str(uuid.uuid4()) for _ in valid_items]
-    docs = [Document(page_content=summary, metadata={ID_KEY: ids[i]}) for i, (_, summary) in enumerate(valid_items)]
-    
-    if docs:
-        vectorstore.add_documents(docs)
-        print(f"✅ Added {len(docs)} documents to vector store")
-    
-    # Store originals in docstore
-    for i, (orig, _) in enumerate(valid_items):
-        docstore[ids[i]] = orig
-
-
-def persist_docstore_index(docstore: Dict[str, Any], cache_file: str):
-    """Persist docstore index to file"""
-    json.dump(list(docstore.keys()), open(cache_file, "w"))
-
-
-def retrieve_parents(vectorstore: Chroma, docstore: Dict[str, Any], query: str, k: int = 6):
-    """Retrieve parent documents from vector store"""
-    hits = vectorstore.similarity_search(query, k=k)
-    return [docstore[h.metadata[ID_KEY]] for h in hits if h.metadata.get(ID_KEY) in docstore]
-
 

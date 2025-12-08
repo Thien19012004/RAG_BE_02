@@ -9,7 +9,7 @@ from langchain_groq import ChatGroq
 from langchain_openai import ChatOpenAI
 
 
-GROQ_TEXT_MODEL = "llama-3.3-70b-versatile"
+GROQ_TEXT_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
 TEXT_SLEEP_SECONDS = 0.5  # Reduced from 3.0 for faster processing
 VISION_MODEL = "gpt-4o-mini"
 VISION_SLEEP_SECONDS = 0.5  # Reduced from 3.0 for faster processing
