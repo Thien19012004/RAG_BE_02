@@ -1,326 +1,443 @@
 # -*- coding: utf-8 -*-
-"""
-FastAPI application for RAG system
-- Upload PDF endpoint
-- Mode-aware query endpoint (document vs corpus)
-"""
+"""FastAPI application for RAG system"""
 
+from __future__ import annotations
+
+import json
 import shutil
-from typing import Literal, Optional, Dict, Tuple
+import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor
-from fastapi.middleware.cors import CORSMiddleware
+from pathlib import Path
+from typing import Optional, Dict, Any, List
+
 from fastapi import FastAPI, File, UploadFile, HTTPException, Form, BackgroundTasks
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from config import FileConfig, CHROMA_DIR
-from langchain_multimodal import ingest_document
-from summarization import build_region_explainer, build_region_explainer_hybrid
+from config import FileConfig, CHROMA_DIR, CACHE_DIR
+from langchain_multimodal import ingest_document, IngestionResult
 from vectorstore_setup import build_local_chroma_backend
-from rag_pipeline import build_document_rag, build_corpus_rag, PromptConfig
+from rag_pipeline import (
+    build_document_rag_chain,
+    build_generative_chain,
+    brainstorm_questions_chain,
+    PromptConfig,
+    REGION_EXPLAIN_INSTRUCTIONS,
+)
+from api_utils import (
+    retrieve_context_for_explain,
+    format_explain_context_for_chain,
+)
+from arxiv_related import suggest_related_papers
 
 
-app = FastAPI(title="RAG PDF API", version="2.0.0")
+# -----------------------------------------------------------------------------
+# FastAPI app & CORS
+# -----------------------------------------------------------------------------
+app = FastAPI(title="RAG PDF API", version="2.2.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173"],
+    allow_origins=["*"],  # dev: mở hết; prod thì siết lại
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Vector backend shared by document + corpus modes
+# -----------------------------------------------------------------------------
+# Global backends (in-memory) + JSON persistence
+# -----------------------------------------------------------------------------
 VECTOR_BACKEND = build_local_chroma_backend(str(CHROMA_DIR / "global_store"))
 
-# In-memory structures ----------------------------------------------------
-pipelines: Dict[str, Dict[str, object]] = {}
-corpus_pipeline: Optional[Tuple[object, object]] = None
+# Pipelines giữ in-memory (có thể build lại từ vector store)
+pipelines: Dict[str, Any] = {}
+
+# 2 dict này sẽ được "backup" xuống file JSON để sau restart vẫn còn
+file_metadata: Dict[str, IngestionResult] = {}
 processing_status: Dict[str, str] = {}
-executor = ThreadPoolExecutor(max_workers=2)
+
+STATUS_REGISTRY = CACHE_DIR / "status_registry.json"
+METADATA_REGISTRY = CACHE_DIR / "metadata_registry.json"
 
 
+def _load_json(path: Path) -> Dict[str, Any]:
+    if not path.exists():
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _save_json(path: Path, data: Dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+def set_status(file_id: str, status: str) -> None:
+    """Update status in memory + persist ra STATUS_REGISTRY."""
+    processing_status[file_id] = status
+    data = _load_json(STATUS_REGISTRY)
+    data[file_id] = status
+    _save_json(STATUS_REGISTRY, data)
+
+
+def get_status(file_id: str) -> Optional[str]:
+    """Lấy status từ cache hoặc từ file JSON."""
+    if file_id in processing_status:
+        return processing_status[file_id]
+    data = _load_json(STATUS_REGISTRY)
+    status = data.get(file_id)
+    if status is not None:
+        processing_status[file_id] = status
+    return status
+
+
+def save_metadata(file_id: str, res: IngestionResult) -> None:
+    """Lưu nhẹ metadata của IngestionResult ra JSON (fake DB)."""
+    file_metadata[file_id] = res
+    data = _load_json(METADATA_REGISTRY)
+    data[file_id] = {
+        "paper_id": res.paper_id,
+        "title": res.title,
+        "abstract": res.abstract,
+        "node_count": res.node_count,
+        "table_count": res.table_count,
+        "image_count": res.image_count,
+        "metadata_path": res.metadata_path,
+    }
+    _save_json(METADATA_REGISTRY, data)
+
+
+def load_metadata(file_id: str) -> Optional[IngestionResult]:
+    """
+    Lấy IngestionResult từ cache hoặc từ file.
+    Đây đóng vai trò stand-in cho database metadata sau này.
+    """
+    if file_id in file_metadata:
+        return file_metadata[file_id]
+
+    # Thử lấy từ registry JSON
+    data = _load_json(METADATA_REGISTRY)
+    payload = data.get(file_id)
+    if payload is None:
+        # Fallback: đọc paper_metadata.json gốc trong cache/<file_id>/
+        cfg = FileConfig(file_id)
+        meta_path = cfg.cache_dir / "paper_metadata.json"
+        if not meta_path.exists():
+            return None
+        try:
+            with open(meta_path, "r", encoding="utf-8") as f:
+                meta = json.load(f)
+        except Exception:
+            return None
+        res = IngestionResult(
+            paper_id=meta.get("paper_id", file_id),
+            title=meta.get("title", ""),
+            abstract=meta.get("abstract", ""),
+            node_count=meta.get("node_count", 0),
+            table_count=meta.get("table_count", 0),
+            image_count=meta.get("image_count", 0),
+            metadata_path=str(meta_path),
+        )
+        file_metadata[file_id] = res
+        return res
+
+    res = IngestionResult(
+        paper_id=payload.get("paper_id", file_id),
+        title=payload.get("title", ""),
+        abstract=payload.get("abstract", ""),
+        node_count=payload.get("node_count", 0),
+        table_count=payload.get("table_count", 0),
+        image_count=payload.get("image_count", 0),
+        metadata_path=payload.get("metadata_path", ""),
+    )
+    file_metadata[file_id] = res
+    return res
+
+
+# -----------------------------------------------------------------------------
+# Pydantic models
+# -----------------------------------------------------------------------------
 class QueryRequest(BaseModel):
     question: str
-    file_id: Optional[str] = None
-    mode: Optional[Literal["document", "corpus"]] = None
-    include_context: bool = False
+    file_id: str
 
 
 class QueryResponse(BaseModel):
     answer: str
     context: Optional[dict] = None
-    mode: Literal["document", "corpus"]
+
+
+class ExplainRequest(BaseModel):
+    image_b64: str
+    file_id: str
+    page_number: Optional[int] = None
+    question: Optional[str] = "Please analyze and explain this cropped region."
 
 
 class UploadResponse(BaseModel):
     message: str
-    filename: str
     file_id: str
     status: str
     processing_time: Optional[float] = None
 
 
-@app.on_event("startup")
-async def startup_event():
-    print("ℹ️ API started. Upload PDFs to build document pipelines or use corpus mode.")
+class RelatedPapersRequest(BaseModel):
+    file_id: str
+    top_k: int = 5
+    max_results: int = 30
 
 
-@app.get("/")
-async def root():
-    """Health check endpoint"""
-    return {"message": "RAG PDF API is running", "status": "healthy"}
+class RelatedPaper(BaseModel):
+    arxiv_id: str
+    title: str
+    abstract: str
+    authors: List[str]
+    categories: List[str]
+    url: str
+    score: float
+    reason: str
 
 
-def build_pipeline_sync(file_config: FileConfig):
-    """Synchronous ingestion + document-mode pipeline build used in background tasks."""
+class RelatedPapersResponse(BaseModel):
+    file_id: str
+    base_title: Optional[str]
+    base_abstract: Optional[str]
+    results: List[RelatedPaper]
+
+
+class BrainstormRequest(BaseModel):
+    file_id: str
+
+class BrainstormResponse(BaseModel):
+    questions: List[str]
+
+# -----------------------------------------------------------------------------
+# Helpers
+# -----------------------------------------------------------------------------
+def validate_file_ready(file_id: str) -> None:
+    status = get_status(file_id)
+    if status is None or status == "unknown":
+        raise HTTPException(404, "File not found")
+    if not status.startswith("completed"):
+        # đang xử lý hoặc lỗi
+        if status.startswith("error"):
+            raise HTTPException(500, f"File processing failed: {status}")
+        raise HTTPException(202, "File processing not finished")
+
+
+async def build_pipeline_sync(file_config: FileConfig) -> None:
+    """
+    Chạy ingest + build RAG chain cho 1 PDF, theo kiểu *đồng bộ*.
+    Được gọi trong /upload – chỉ trả response khi xong.
+    """
     try:
-        print(f"🟠 [UPLOAD] Begin processing for file_id={file_config.file_id}")
-        processing_status[file_config.file_id] = "processing"
-        ingestion_result = ingest_document(file_config, VECTOR_BACKEND)
+        set_status(file_config.file_id, "processing")
+        res = await ingest_document(file_config, VECTOR_BACKEND)
+
+        # Build query chain chuẩn
         prompt_cfg = PromptConfig(
-            mode="document",
             paper_id=file_config.file_id,
-            paper_title=ingestion_result.title,
+            paper_title=res.title,
         )
-        rag_chain, rag_chain_with_ctx = build_document_rag(
-            paper_id=file_config.file_id,
-            backend=VECTOR_BACKEND,
-            prompt_cfg=prompt_cfg,
-        )
-        pipelines[file_config.file_id] = {
-            "chains": (rag_chain, rag_chain_with_ctx),
-            "metadata": ingestion_result,
-        }
-        processing_status[file_config.file_id] = "completed"
-        print(f"🟢 [UPLOAD] Completed processing for file_id={file_config.file_id}")
-        return True
+        chain = build_document_rag_chain(file_config.file_id, VECTOR_BACKEND, prompt_cfg)
+
+        pipelines[file_config.file_id] = chain
+        save_metadata(file_config.file_id, res)
+        set_status(file_config.file_id, "completed")
     except Exception as e:
-        print(f"🔴 [UPLOAD] Error while processing file_id={file_config.file_id}: {str(e)}")
-        processing_status[file_config.file_id] = f"error: {str(e)}"
-        return False
+        print(f"Error while building pipeline for {file_config.file_id}: {e}")
+        set_status(file_config.file_id, f"error: {str(e)}")
 
 
+# -----------------------------------------------------------------------------
+# Endpoints
+# -----------------------------------------------------------------------------
 @app.post("/upload", response_model=UploadResponse)
 async def upload_pdf(
-    background_tasks: BackgroundTasks,
-    file: UploadFile = File(...), 
-    file_id: Optional[str] = Form(default=None)
+    file: UploadFile = File(...),
+    file_id: Optional[str] = Form(None),
 ):
     """
-    Upload a PDF file and process it asynchronously for better performance
+    Upload PDF và build pipeline *đồng bộ*.
+
+    - Request: multipart/form-data với file + optional file_id
+    - Response: UploadResponse(message, file_id, status, processing_time)
     """
-    if not file.filename.lower().endswith('.pdf'):
-        raise HTTPException(status_code=400, detail="Only PDF files are allowed")
-    
-    try:
-        import time
-        start_time = time.time()
-        
-        # Resolve or generate file_id
-        fid = file_id or str(uuid.uuid4())
-        print(f"⬆️  [UPLOAD] Receiving file '{file.filename}' -> file_id={fid}")
-        
-        # Create file config
-        file_config = FileConfig(fid)
-        
-        # Save uploaded file
-        with open(file_config.pdf_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
-        print(f"💾 [UPLOAD] Saved PDF to {file_config.pdf_path}")
-        
-        # Start background processing
-        processing_status[fid] = "queued"
-        print(f"🕓 [UPLOAD] Queued processing for file_id={fid}")
-        background_tasks.add_task(build_pipeline_sync, file_config)
-        
-        processing_time = time.time() - start_time
-        
-        return UploadResponse(
-            message="PDF uploaded successfully. Processing in background.",
-            filename=file.filename,
-            file_id=fid,
-            status="processing",
-            processing_time=processing_time
-        )
-        
-    except Exception as e:
-        print(f"🔴 [UPLOAD] Error during upload: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Error uploading PDF: {str(e)}")
+    fid = file_id or str(uuid.uuid4())
+    file_config = FileConfig(fid)
 
+    # Lưu file
+    with open(file_config.pdf_path, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
 
-class ExplainRequest(BaseModel):
-    image_b64: str
-    file_id: Optional[str] = None
-    page_number: Optional[int] = None
-    # Optional crop rect (normalized or px from FE if needed later)
-    rect: Optional[dict] = None
+    start = time.time()
+    # Không dùng background task nữa – chạy trực tiếp
+    await build_pipeline_sync(file_config)
+    elapsed = time.time() - start
 
+    status = get_status(fid) or "unknown"
+    if status.startswith("error"):
+        # nếu ingest fail thì báo lỗi luôn
+        raise HTTPException(status_code=500, detail=status)
 
-class ExplainResponse(BaseModel):
-    explanation: str
-
-
-@app.post("/explain-region", response_model=ExplainResponse)
-async def explain_region(req: ExplainRequest):
-    """
-    Explain a cropped region (math formula, table, figure, or text) from base64 image.
-    FE should send base64 data URL payload (only the base64 part is needed).
-    """
-    try:
-        if not req.image_b64 or len(req.image_b64) < 50:
-            raise HTTPException(status_code=400, detail="Invalid image_b64")
-
-        print(f"🟠 [EXPLAIN] Received region for analysis (size={len(req.image_b64)} chars)")
-
-        context_text = ""
-        used_hybrid = False
-
-        # If file_id provided, try to load cached summaries to serve as textual context
-        if req.file_id:
-            try:
-                file_config = FileConfig(req.file_id)
-                cache_text = file_config.cache_dir / "text_summaries.json"
-                cache_table = file_config.cache_dir / "table_summaries.json"
-                cache_image = file_config.cache_dir / "image_summaries.json"
-
-                snippets = []
-                import json
-                if cache_text.exists():
-                    txts = json.load(open(cache_text, encoding="utf-8"))
-                    snippets.extend([t for t in txts if isinstance(t, str) and t.strip()][:8])
-                if cache_table.exists():
-                    tabs = json.load(open(cache_table, encoding="utf-8"))
-                    snippets.extend([t for t in tabs if isinstance(t, str) and t.strip()][:4])
-                if cache_image.exists():
-                    imgs = json.load(open(cache_image, encoding="utf-8"))
-                    snippets.extend([t for t in imgs if isinstance(t, str) and t.strip()][:4])
-
-                # Join and cap length
-                context_text = "\n---\n".join(snippets)
-                if len(context_text) > 4000:
-                    context_text = context_text[:4000] + " ..."
-
-                if context_text.strip():
-                    print(f"📚 [EXPLAIN] Using hybrid context from cache (len={len(context_text)}) for file_id={req.file_id}")
-                    chain = build_region_explainer_hybrid()
-                    explanation = chain.invoke({"image_b64": req.image_b64, "context_text": context_text})
-                    used_hybrid = True
-                else:
-                    print("ℹ️ [EXPLAIN] No non-empty context found in cache; falling back to vision-only")
-            except Exception as ctx_e:
-                print(f"⚠️ [EXPLAIN] Failed to load context for file_id={req.file_id}: {str(ctx_e)}")
-
-        if not used_hybrid:
-            chain = build_region_explainer()
-            explanation = chain.invoke({"image_b64": req.image_b64})
-
-        print("🟢 [EXPLAIN] Explanation generated")
-        return ExplainResponse(explanation=explanation.strip() if explanation else "")
-    except HTTPException:
-        raise
-    except Exception as e:
-        print(f"🔴 [EXPLAIN] Error: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Error explaining region: {str(e)}")
+    return UploadResponse(
+        message="Uploaded",
+        file_id=fid,
+        status=status,
+        processing_time=elapsed,
+    )
 
 
 @app.post("/query", response_model=QueryResponse)
-async def query_pdf(request: QueryRequest):
+async def query_pdf(req: QueryRequest):
+    """Text query chuẩn trên 1 PDF đã ingest."""
+    validate_file_ready(req.file_id)
+    chain = pipelines.get(req.file_id)
+
+    # Nếu server restart mất pipeline in-memory thì build lại từ vector store
+    if chain is None:
+        res = load_metadata(req.file_id)
+        if res is None:
+            raise HTTPException(404, "Metadata not found for this file")
+        prompt_cfg = PromptConfig(
+            paper_id=req.file_id,
+            paper_title=res.title,
+        )
+        chain = build_document_rag_chain(req.file_id, VECTOR_BACKEND, prompt_cfg)
+        pipelines[req.file_id] = chain
+
+    out = chain.invoke({"question": req.question})
+    # rag_pipeline trả {"response": answer, "context": ctx}
+    return QueryResponse(answer=out["response"], context=out.get("context"))
+
+
+@app.post("/explain-region", response_model=QueryResponse)
+async def explain_region(req: ExplainRequest):
     """
-    Mode-aware querying. Defaults to document mode when file_id is provided, otherwise corpus mode.
+    Giải thích 1 vùng crop từ PDF (image + local context xung quanh).
     """
-    mode = request.mode or ("document" if request.file_id else "corpus")
+    validate_file_ready(req.file_id)
 
-    if mode == "document":
-        if not request.file_id:
-            raise HTTPException(status_code=400, detail="file_id required for document mode")
-        status = processing_status.get(request.file_id)
-        if status in {"queued", "processing"}:
-            raise HTTPException(status_code=202, detail=f"File is still processing. Status: {status}")
-        if status and status.startswith("error"):
-            raise HTTPException(status_code=500, detail=f"Processing failed: {status}")
-        if request.file_id not in pipelines:
-            raise HTTPException(status_code=404, detail="Unknown file_id. Please upload first.")
+    # 1) Lấy context hybrid (vector + cache)
+    context_data = retrieve_context_for_explain(
+        file_id=req.file_id,
+        backend=VECTOR_BACKEND,
+        page_number=req.page_number,
+    )
 
-        rag_chain, rag_chain_with_ctx = pipelines[request.file_id]["chains"]
-        try:
-            if request.include_context:
-                result = rag_chain_with_ctx.invoke(request.question)
-                return QueryResponse(
-                    answer=result["response"],
-                    context=result.get("context"),
-                    mode="document",
-                )
-            answer = rag_chain.invoke(request.question)
-            return QueryResponse(answer=answer, mode="document")
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Error processing document query: {str(e)}")
+    # 2) Prompt config riêng cho region explain
+    prompt_cfg = PromptConfig(
+        paper_id=req.file_id,
+        system_instructions=REGION_EXPLAIN_INSTRUCTIONS,
+        is_visual_explanation=True,
+    )
 
-    # Corpus mode ---------------------------------------------------------
-    global corpus_pipeline
-    if corpus_pipeline is None:
-        print("ℹ️ [QUERY] Initializing corpus pipeline lazily")
-        prompt_cfg = PromptConfig(mode="corpus")
-        corpus_pipeline = build_corpus_rag(VECTOR_BACKEND, prompt_cfg=prompt_cfg)
+    # 3) Gọi shared multimodal chain
+    gen_chain = build_generative_chain()
+    answer = gen_chain.invoke(
+        {
+            "context": context_data,
+            "question": req.question or "Explain this region.",
+            "prompt_cfg": prompt_cfg,
+            "focus_image_b64": req.image_b64,
+        }
+    )
 
-    rag_chain, rag_chain_with_ctx = corpus_pipeline
-    try:
-        if request.include_context:
-            result = rag_chain_with_ctx.invoke(request.question)
-            return QueryResponse(
-                answer=result["response"],
-                context=result.get("context"),
-                mode="corpus",
-            )
-        answer = rag_chain.invoke(request.question)
-        return QueryResponse(answer=answer, mode="corpus")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error processing corpus query: {str(e)}")
+    # 4) Thêm crop image vào context trả về cho FE (debug / hiển thị)
+    final_context = format_explain_context_for_chain(
+        context_data, req.image_b64, req.page_number
+    )
+
+    return QueryResponse(answer=answer, context=final_context)
 
 
-@app.get("/status")
-async def get_status():
-    """Get current status of the system"""
-    known = []
-    for fid in pipelines.keys():
-        file_config = FileConfig(fid)
-        status = processing_status.get(fid, "completed")
-        known.append({
-            "file_id": fid,
-            "pdf_path": str(file_config.pdf_path),
-            "cache_dir": str(file_config.cache_dir),
-            "vector_backend": "local-chroma",
-            "status": status,
-            "title": getattr(pipelines[fid].get("metadata"), "title", None),
-            "mode": "document",
-        })
+@app.post("/related-papers", response_model=RelatedPapersResponse)
+async def related_papers(req: RelatedPapersRequest):
+    """
+    Gợi ý các paper liên quan trên arXiv cho file hiện tại.
 
-    return {
-        "pipelines": known,
-        "count": len(known),
-        "processing_status": processing_status,
-    }
+    - Dùng title + abstract đã ingest làm "base paper"
+    - Arxiv search + LLM re-rank (trong arxiv_related.suggest_related_papers)
+    """
+    validate_file_ready(req.file_id)
+
+    meta = load_metadata(req.file_id)
+    if meta is None:
+        raise HTTPException(
+            400,
+            "No metadata found for this file; cannot suggest related papers.",
+        )
+
+    base_title = meta.title or ""
+    base_abstract = meta.abstract or ""
+
+    related = suggest_related_papers(
+        base_title=base_title,
+        base_abstract=base_abstract,
+        categories=None,  # sau này có arxiv category thì truyền vào
+        max_results=req.max_results,
+        top_k=req.top_k,
+    )
+
+    results_models = [
+        RelatedPaper(
+            arxiv_id=item.get("arxiv_id", ""),
+            title=item.get("title", ""),
+            abstract=item.get("abstract", ""),
+            authors=item.get("authors") or [],
+            categories=item.get("categories") or [],
+            url=item.get("url", ""),
+            score=float(item.get("score", 0.0) or 0.0),
+            reason=item.get("reason", ""),
+        )
+        for item in related
+    ]
+
+    return RelatedPapersResponse(
+        file_id=req.file_id,
+        base_title=base_title,
+        base_abstract=base_abstract,
+        results=results_models,
+    )
+
+
+@app.post("/brainstorm-questions", response_model=BrainstormResponse)
+async def brainstorm_questions(req: BrainstormRequest):
+    """
+    Gợi ý các câu hỏi thông minh dựa trên nội dung Abstract của bài báo.
+    """
+    # 1. Kiểm tra file đã sẵn sàng chưa
+    validate_file_ready(req.file_id)
+
+    # 2. Lấy metadata (Title & Abstract)
+    meta = load_metadata(req.file_id)
+    if not meta:
+        raise HTTPException(status_code=404, detail="Metadata not found for brainstorming")
+
+    # 3. Gọi LLM sinh câu hỏi
+    # Lưu ý: Bạn có thể cache kết quả này vào METADATA_REGISTRY nếu không muốn gọi LLM nhiều lần cho cùng 1 file
+    questions = brainstorm_questions_chain(
+        title=meta.title or "Unknown Title", 
+        abstract=meta.abstract or "No abstract available."
+    )
+
+    return BrainstormResponse(questions=questions)
 
 
 @app.get("/status/{file_id}")
 async def get_file_status(file_id: str):
-    """Get processing status for a specific file"""
-    if file_id not in processing_status and file_id not in pipelines:
-        raise HTTPException(status_code=404, detail="File not found")
-    
-    status = processing_status.get(file_id, "completed")
-    is_ready = file_id in pipelines
-    
+    status = get_status(file_id) or "unknown"
     return {
-        "file_id": file_id,
         "status": status,
-        "ready": is_ready,
-        "can_query": is_ready and not status.startswith("error"),
-        "title": getattr(pipelines.get(file_id, {}).get("metadata"), "title", None),
+        "ready": file_id in pipelines and status.startswith("completed"),
     }
 
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
 
+    uvicorn.run(app, host="0.0.0.0", port=8000)

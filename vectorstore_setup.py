@@ -6,15 +6,11 @@ from langchain_chroma import Chroma
 from langchain_core.documents import Document
 from langchain_openai import OpenAIEmbeddings
 
-
 DEFAULT_EMBED_MODEL = "text-embedding-3-small"
-ABSTRACT_COLLECTION = "abstract_store"
+# Chỉ còn duy nhất một collection cho toàn bộ nội dung paper
 CONTENT_COLLECTION = "content_store"
 
-
 class VectorStoreBackend(Protocol):
-    """Minimal interface for vector backends so we can swap implementations easily."""
-
     def add_documents(self, docs: List[Document], collection: str) -> None:
         ...
 
@@ -30,18 +26,12 @@ class VectorStoreBackend(Protocol):
     def delete_where(self, collection: str, where: Dict[str, Any]) -> None:
         ...
 
-
 @dataclass
 class BackendInitConfig:
-    """Configuration payload for vector backends."""
-
     persist_dir: Path
     embedding_model: str = DEFAULT_EMBED_MODEL
 
-
 class LocalChromaBackend:
-    """Disk-based Chroma backend that satisfies the VectorStoreBackend protocol."""
-
     def __init__(self, config: BackendInitConfig):
         self.config = config
         self.config.persist_dir.mkdir(parents=True, exist_ok=True)
@@ -73,24 +63,20 @@ class LocalChromaBackend:
         where: Optional[Dict[str, Any]] = None,
     ) -> List[Document]:
         store = self._get_store(collection)
+        # ChromaDB sử dụng tham số 'filter' cho siêu dữ liệu
         return store.similarity_search(query, k=k, filter=where)
 
     def delete_where(self, collection: str, where: Dict[str, Any]) -> None:
         store = self._get_store(collection)
         store.delete(where=where)
 
-
 def get_embedding_model(model: str = DEFAULT_EMBED_MODEL) -> OpenAIEmbeddings:
-    """Helper to build a shared embedding model instance."""
     return OpenAIEmbeddings(model=model)
 
-
 def build_local_chroma_backend(base_path: str, model: str = DEFAULT_EMBED_MODEL) -> LocalChromaBackend:
-    """Factory for the default LocalChroma backend."""
     return LocalChromaBackend(
         BackendInitConfig(
             persist_dir=Path(base_path),
             embedding_model=model,
         )
     )
-

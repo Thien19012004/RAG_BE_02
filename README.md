@@ -58,3 +58,6 @@ curl -X POST "http://localhost:8000/query" \
 - `summarization.py` - Content summarization
 - `vectorstore_setup.py` - Vector database setup
 - `rag_pipeline.py` - RAG chain construction
+
+
+docker run -t --rm --init -p 8070:8070 -p 8071:8071 lfoppiano/grobid:0.8.2

@@ -17,5 +17,6 @@ pydantic
 aiofiles
 asyncio-throttle
 pymupdf
-camelot-py
+camelot-py[cv]
 opencv-python-headless
+arxiv 

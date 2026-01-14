@@ -6,7 +6,9 @@ Document ingestion pipeline responsible for:
 - semantic node construction
 - writing abstract/content docs into the configured vector backend
 """
-
+import asyncio
+import re
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 import json
 from typing import Any, Dict, List
@@ -30,7 +32,6 @@ from parallel_processing import (
     summarize_images_parallel,
 )
 from vectorstore_setup import (
-    ABSTRACT_COLLECTION,
     CONTENT_COLLECTION,
     VectorStoreBackend,
     get_embedding_model,
@@ -79,8 +80,17 @@ def _sanitize_metadata(meta: Dict[str, Any]) -> Dict[str, Any]:
             cleaned[k] = str(v)
     return cleaned
 
+def _norm_text(s: str) -> List[str]:
+    s = re.sub(r"\s+", " ", s.strip().lower())
+    return [w for w in s.split(" ") if w]
 
-def ingest_document(file_config, backend: VectorStoreBackend) -> IngestionResult:
+def _overlap_score(a_words: List[str], b_words: List[str]) -> float:
+    if not a_words or not b_words: return 0.0
+    a_set, b_set = set(a_words), set(b_words)
+    inter = len(a_set & b_set)
+    return inter / max(1, len(a_set))
+
+async def ingest_document(file_config, backend: VectorStoreBackend) -> IngestionResult:
     """Ingest a PDF into the abstract/content stores while keeping caches updated."""
     print(f"🔧 [PIPELINE] Start ingest for paper_id={file_config.file_id}")
     need_rebuild, pdf_hash = file_config.needs_rebuild()
@@ -91,19 +101,21 @@ def ingest_document(file_config, backend: VectorStoreBackend) -> IngestionResult
     # -------------------------------------------------------------------------
     # 1) Dual extraction: GROBID (semantic sections) + PyMuPDF/Camelot layout
     # -------------------------------------------------------------------------
-    grobid_payload = run_grobid(pdf_path_str, paper_id=file_config.file_id)
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        loop = asyncio.get_event_loop()
+        f_grobid = loop.run_in_executor(executor, run_grobid, pdf_path_str, file_config.file_id)
+        f_layout = loop.run_in_executor(executor, extract_layout_blocks, pdf_path_str)
+        f_tables = loop.run_in_executor(executor, extract_table_blocks, pdf_path_str)
+        f_images = loop.run_in_executor(executor, extract_image_blocks, pdf_path_str)
+
+        grobid_payload, layout_blocks, table_blocks, image_blocks = await asyncio.gather(
+            f_grobid, f_layout, f_tables, f_images
+        )
+        
     print(
         f"🧠 [PIPELINE] GROBID sections={len(grobid_payload.sections)} "
         f"title={grobid_payload.title}"
     )
-
-    # Layout text blocks from PyMuPDF
-    layout_blocks = extract_layout_blocks(pdf_path_str)
-    # Tables from Camelot
-    table_blocks = extract_table_blocks(pdf_path_str)
-    # Figures/images from PyMuPDF
-    image_blocks = extract_image_blocks(pdf_path_str)
-
     print(
         "🧩 [PIPELINE] Layout blocks -> "
         f"tables={len(table_blocks)}, texts={len(layout_blocks)}, images={len(image_blocks)}"
@@ -131,24 +143,17 @@ def ingest_document(file_config, backend: VectorStoreBackend) -> IngestionResult
     text_summarizer = build_text_summarizer()
     vision_summarizer = build_vision_summarizer()
 
-    table_summaries = summarize_texts_parallel(
+    table_task = summarize_texts_parallel(
         [tbl.plaintext for tbl in table_blocks],
         str(file_config.cache_dir / "table_summaries.json"),
-        text_summarizer,
-        to_str=lambda x: x,
-        use_cache=not need_rebuild,
-        batch_size=6,
-        max_workers=4,
+        text_summarizer, use_cache=not need_rebuild
     )
-
-    image_summaries = summarize_images_parallel(
+    image_task = summarize_images_parallel(
         [img.image_b64 for img in image_blocks],
         str(file_config.cache_dir / "image_summaries.json"),
-        vision_summarizer,
-        use_cache=not need_rebuild,
-        batch_size=3,
-        max_workers=4,
+        vision_summarizer, use_cache=not need_rebuild
     )
+    table_summaries, image_summaries = await asyncio.gather(table_task, image_task)
     print(
         "📈 [PIPELINE] Summaries -> "
         f"tables={len(table_summaries)}, images={len(image_summaries)}"
@@ -158,59 +163,49 @@ def ingest_document(file_config, backend: VectorStoreBackend) -> IngestionResult
     # 4) Ghi vào vector store (content + abstract)
     # -------------------------------------------------------------------------
     backend.delete_where(CONTENT_COLLECTION, {"paper_id": file_config.file_id})
-    backend.delete_where(ABSTRACT_COLLECTION, {"paper_id": file_config.file_id})
 
     documents: List[Document] = []
 
-    # 4a) Ưu tiên semantic nodes: mỗi node là 1 retrieval unit có bbox
-    if nodes:
-        for node in nodes:
-            page_label = (
-                node.page_number
-                or node.approx_page_start
-                or node.approx_page_end
-            )
+    # 4a) Thêm Abstract như một node bình thường với modality="abstract"
+    abstract_text = grobid_payload.abstract or ""
+    abstract_page = None
+    abstract_bbox = None
 
-            metadata = _sanitize_metadata(
-                {
-                    "paper_id": file_config.file_id,
-                    "section_title": node.section_title,
-                    "modality": "text",
-                    "order_idx": node.order_idx,
-                    "page_label": page_label,
-                    "page_start": node.approx_page_start,
-                    "page_end": node.approx_page_end,
-                    # raw PDF bbox + layout_size (để FE normalize highlight)
-                    "bbox": node.bbox,
-                }
-            )
-            documents.append(Document(page_content=node.text, metadata=metadata))
-    else:
-        # 4b) Fallback khi không build được semantic nodes:
-        # dùng raw layout block text làm retrieval unit, vẫn gắn page + bbox
-        print(
-            "⚠️ [PIPELINE] No semantic nodes; falling back to layout blocks "
-            "as retrieval units."
-        )
-        for idx, blk in enumerate(layout_blocks):
-            if not getattr(blk, "text", "").strip():
-                continue
-            page_label = getattr(blk, "page_number", None)
-            metadata = _sanitize_metadata(
-                {
-                    "paper_id": file_config.file_id,
-                    "section_title": f"Block {idx+1}",
-                    "modality": "text",
-                    "order_idx": idx,
-                    "page_label": page_label,
-                    "page_start": page_label,
-                    "page_end": page_label,
-                    "bbox": getattr(blk, "bbox", None),
-                }
-            )
-            documents.append(Document(page_content=blk.text, metadata=metadata))
+    if abstract_text.strip():
+        abs_words = _norm_text(abstract_text[:500])
+        best_score = 0.0
+        for blk in layout_blocks:
+            if blk.page_number > 2: continue
+            score = _overlap_score(abs_words, _norm_text(blk.text))
+            if score > best_score:
+                best_score = score
+                abstract_page, abstract_bbox = blk.page_number, blk.bbox
+        
+        if best_score < 0.2: abstract_page = 1
 
-    # 4c) Tables (Camelot) – mỗi bảng có bbox riêng để highlight
+        abs_meta = _sanitize_metadata({
+            "paper_id": file_config.file_id,
+            "title": grobid_payload.title,
+            "section_title": "Abstract",
+            "modality": "abstract",
+            "page_label": abstract_page,
+            "bbox": abstract_bbox,
+        })
+        documents.append(Document(page_content=abstract_text, metadata=abs_meta))
+
+    # 4b) Thêm Semantic Nodes
+    for node in nodes:
+        page_val = node.page_number or node.approx_page_start
+        metadata = _sanitize_metadata({
+            "paper_id": file_config.file_id,
+            "section_title": node.section_title,
+            "modality": "text",
+            "page_label": page_val,
+            "bbox": node.bbox,
+        })
+        documents.append(Document(page_content=node.text, metadata=metadata))
+
+    # 4c) Tables – mỗi bảng có bbox riêng để highlight
     for idx, (tbl, summary) in enumerate(zip(table_blocks, table_summaries)):
         if not summary:
             continue
@@ -249,33 +244,6 @@ def ingest_document(file_config, backend: VectorStoreBackend) -> IngestionResult
     backend.add_documents(documents, CONTENT_COLLECTION)
     print(f"📦 [PIPELINE] Added {len(documents)} docs to content collection")
 
-    # -------------------------------------------------------------------------
-    # 5) Abstract store: ưu tiên abstract từ GROBID
-    # -------------------------------------------------------------------------
-    if grobid_payload.abstract:
-        abstract_text = grobid_payload.abstract
-    elif nodes:
-        abstract_text = nodes[0].text
-    else:
-        # Join a few non-empty table summaries to approximate an abstract
-        non_empty_tables = [
-            s for s in table_summaries if isinstance(s, str) and s.strip()
-        ]
-        joined = " ".join(non_empty_tables[:3])
-        abstract_text = joined[:2000]
-
-    abstract_metadata = _sanitize_metadata(
-        {
-            "paper_id": file_config.file_id,
-            "title": grobid_payload.title,
-            "authors": grobid_payload.authors,
-            "section_title": "Abstract",
-            "modality": "abstract",
-        }
-    )
-    abstract_doc = Document(page_content=abstract_text, metadata=abstract_metadata)
-    backend.add_documents([abstract_doc], ABSTRACT_COLLECTION)
-    print("📚 [PIPELINE] Abstract added to abstract collection")
 
     # -------------------------------------------------------------------------
     # 6) Cache metadata + hash

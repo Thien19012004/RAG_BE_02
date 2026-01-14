@@ -1,3 +1,4 @@
+from __future__ import annotations
 import os
 import re
 import base64
@@ -66,6 +67,87 @@ class ImageBlock:
     page_number: int
     bbox: Optional[Dict[str, float]] = None
 
+
+def _rows_to_html(rows: List[List[str]]) -> str:
+    # HTML đơn giản (không border) để phục vụ retrieval
+    if not rows:
+        return "<table></table>"
+
+    def esc(s: str) -> str:
+        return (
+            s.replace("&", "&amp;")
+             .replace("<", "&lt;")
+             .replace(">", "&gt;")
+             .replace('"', "&quot;")
+        )
+
+    html = ["<table>"]
+    for r in rows:
+        html.append("<tr>")
+        for c in r:
+            html.append(f"<td>{esc(c or '')}</td>")
+        html.append("</tr>")
+    html.append("</table>")
+    return "".join(html)
+
+
+def _rows_to_plaintext(rows: List[List[str]]) -> str:
+    # Plaintext dạng fixed-width-ish (join bằng tab)
+    return "\n".join("\t".join((c or "").strip() for c in r) for r in rows)
+
+def _maybe_has_table_like_structure(page) -> bool:
+    """
+    Heuristic nhanh cho paper:
+    - Nếu có caption "Table"/"TABLE" -> rất likely có table
+    - Nếu không, dùng pattern text: nhiều words + nhiều cột (x positions lặp) -> có thể là stream table
+    - Fallback: nếu có nhiều line drawings -> lattice table
+    """
+    try:
+        # 1) Caption keyword (rất hiệu quả cho paper)
+        text = page.get_text("text") or ""
+        if "table" in text.lower():
+            return True
+
+        # 2) Stream-table heuristic: nhiều words và nhiều cột
+        words = page.get_text("words")  # list: [x0,y0,x1,y1,"word",block,line,word_no]
+        if not words or len(words) < 200:
+            # ít text thì ít khả năng là table (paper pages thường nhiều chữ)
+            pass
+        else:
+            # lấy x0 của word, bucket theo bước 6pt để chống noise
+            buckets = {}
+            for w in words:
+                x0 = float(w[0])
+                key = int(x0 // 6)  # bucket 6pt
+                buckets[key] = buckets.get(key, 0) + 1
+
+            # số bucket “đáng kể” (xuất hiện nhiều lần) càng nhiều => càng giống bảng/cột
+            strong_cols = sum(1 for _, cnt in buckets.items() if cnt >= 25)
+
+            # paper bình thường 2 cột cũng có, nên threshold phải hơi cẩn thận:
+            # - nếu >= 5 cột mạnh -> khá giống table
+            # - hoặc words rất nhiều và >= 4 cột mạnh
+            if strong_cols >= 5:
+                return True
+            if len(words) >= 450 and strong_cols >= 4:
+                return True
+
+        # 3) Lattice fallback: có nhiều line drawings
+        drawings = page.get_drawings()
+        if drawings:
+            line_cnt = 0
+            for d in drawings:
+                for it in d.get("items", []):
+                    if it and it[0] == "l":
+                        line_cnt += 1
+                        if line_cnt >= 12:
+                            return True
+
+        return False
+
+    except Exception:
+        # đừng skip quá tay nếu heuristic lỗi
+        return True
 
 # ------------------------------------------------------------------------------------
 #                                GROBID / TEI PARSING
@@ -463,7 +545,92 @@ def extract_layout_blocks(pdf_path: str) -> List[LayoutBlock]:
     return blocks
 
 
-def extract_table_blocks(pdf_path: str) -> List[TableBlock]:
+def extract_table_blocks(pdf_path: str) -> List["TableBlock"]:
+    """
+    Extract tables using PyMuPDF (fitz) for speed.
+
+    PyMuPDF 1.24.9 supports page.find_tables().
+    Returns TableBlock(html, plaintext, page_number, bbox).
+    """
+    try:
+        import fitz  # PyMuPDF
+    except Exception as exc:  # pragma: no cover
+        print(f"ℹ️ PyMuPDF not installed or failed to import ({exc}); skipping table extraction.")
+        return []
+
+    blocks: List["TableBlock"] = []
+    doc = None
+    try:
+        doc = fitz.open(pdf_path)
+
+        for page_index in range(doc.page_count):
+            page = doc.load_page(page_index)
+
+            # ✅ tốc độ: skip nhanh page “ít khả năng có table”
+            if not _maybe_has_table_like_structure(page):
+                continue
+
+            # ✅ table detection
+            try:
+                result = page.find_tables(
+                    # Các params dưới đây bạn có thể tune nếu bảng bị tách sai
+                    snap_tolerance=3,
+                    join_tolerance=3,
+                    edge_min_length=3,
+                    min_words_vertical=2,
+                    min_words_horizontal=1,
+                )
+            except Exception as exc:
+                print(f"⚠️ find_tables failed on page {page_index + 1}: {exc}")
+                continue
+
+            table_list = getattr(result, "tables", None) or []
+            if not table_list:
+                continue
+
+            for tb in table_list:
+                try:
+                    rows = tb.extract()  # -> List[List[str]]
+                except Exception:
+                    rows = []
+
+                if not rows:
+                    continue
+
+                # bbox trong hệ tọa độ PyMuPDF: (x0,y0,x1,y1) top-left origin
+                bbox: Optional[Dict[str, float]] = None
+                try:
+                    rect = getattr(tb, "bbox", None)
+                    if rect is not None:
+                        bbox = {
+                            "x1": float(rect.x0),
+                            "y1": float(rect.y0),
+                            "x2": float(rect.x1),
+                            "y2": float(rect.y1),
+                        }
+                except Exception:
+                    bbox = None
+
+                html = _rows_to_html(rows)
+                plaintext = _rows_to_plaintext(rows)
+
+                blocks.append(
+                    TableBlock(
+                        html=html,
+                        plaintext=plaintext,
+                        page_number=page_index + 1,
+                        bbox=bbox,
+                    )
+                )
+
+        return blocks
+
+    finally:
+        try:
+            if doc is not None:
+                doc.close()
+        except Exception:
+            pass
     """
     Extract tables using Camelot, if available.
 
