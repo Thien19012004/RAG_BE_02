@@ -14,7 +14,7 @@ from fastapi import FastAPI, File, UploadFile, HTTPException, Form, BackgroundTa
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from config import FileConfig, CHROMA_DIR, CACHE_DIR
+from config import FileConfig, CHROMA_DIR, CACHE_DIR, CONTENT_DIR, settings
 from langchain_multimodal import ingest_document, IngestionResult
 from vectorstore_setup import build_local_chroma_backend
 from rag_pipeline import (
@@ -183,6 +183,17 @@ class UploadResponse(BaseModel):
     file_id: str
     status: str
     processing_time: Optional[float] = None
+    title: Optional[str] = None
+    abstract: Optional[str] = None
+    node_count: Optional[int] = None
+    table_count: Optional[int] = None
+    image_count: Optional[int] = None
+
+
+class IngestFromUrlRequest(BaseModel):
+    """Request to ingest a PDF from a cloud URL (S3/MinIO)."""
+    file_url: str
+    file_id: Optional[str] = None
 
 
 class RelatedPapersRequest(BaseModel):
@@ -229,13 +240,20 @@ def validate_file_ready(file_id: str) -> None:
         raise HTTPException(202, "File processing not finished")
 
 
-async def build_pipeline_sync(file_config: FileConfig) -> None:
+async def build_pipeline_sync(file_config: FileConfig) -> IngestionResult:
     """
     Chạy ingest + build RAG chain cho 1 PDF, theo kiểu *đồng bộ*.
     Được gọi trong /upload – chỉ trả response khi xong.
+
+    Returns:
+        IngestionResult with metadata from ingestion
     """
     try:
         set_status(file_config.file_id, "processing")
+
+        # Ensure file is downloaded if from cloud
+        file_config.ensure_local_file()
+
         res = await ingest_document(file_config, VECTOR_BACKEND)
 
         # Build query chain chuẩn
@@ -248,9 +266,12 @@ async def build_pipeline_sync(file_config: FileConfig) -> None:
         pipelines[file_config.file_id] = chain
         save_metadata(file_config.file_id, res)
         set_status(file_config.file_id, "completed")
+
+        return res
     except Exception as e:
         print(f"Error while building pipeline for {file_config.file_id}: {e}")
         set_status(file_config.file_id, f"error: {str(e)}")
+        raise
 
 
 # -----------------------------------------------------------------------------
@@ -265,31 +286,78 @@ async def upload_pdf(
     Upload PDF và build pipeline *đồng bộ*.
 
     - Request: multipart/form-data với file + optional file_id
-    - Response: UploadResponse(message, file_id, status, processing_time)
+    - Response: UploadResponse(message, file_id, status, processing_time, metadata)
     """
     fid = file_id or str(uuid.uuid4())
     file_config = FileConfig(fid)
 
-    # Lưu file
-    with open(file_config.pdf_path, "wb") as buffer:
+    # Lưu file vào local (original behavior)
+    with open(file_config._local_pdf_path, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
 
     start = time.time()
-    # Không dùng background task nữa – chạy trực tiếp
-    await build_pipeline_sync(file_config)
-    elapsed = time.time() - start
+    try:
+        res = await build_pipeline_sync(file_config)
+        elapsed = time.time() - start
 
-    status = get_status(fid) or "unknown"
-    if status.startswith("error"):
-        # nếu ingest fail thì báo lỗi luôn
-        raise HTTPException(status_code=500, detail=status)
+        return UploadResponse(
+            message="Uploaded and processed successfully",
+            file_id=fid,
+            status="completed",
+            processing_time=elapsed,
+            title=res.title,
+            abstract=res.abstract,
+            node_count=res.node_count,
+            table_count=res.table_count,
+            image_count=res.image_count,
+        )
+    except Exception as e:
+        elapsed = time.time() - start
+        status = get_status(fid) or "error"
+        raise HTTPException(status_code=500, detail=str(e))
 
-    return UploadResponse(
-        message="Uploaded",
-        file_id=fid,
-        status=status,
-        processing_time=elapsed,
-    )
+
+@app.post("/ingest-from-url", response_model=UploadResponse)
+async def ingest_from_url(req: IngestFromUrlRequest):
+    """
+    Ingest a PDF from a cloud URL (S3/MinIO).
+
+    This endpoint is designed for Backend integration:
+    1. Backend uploads PDF to S3
+    2. Backend calls this endpoint with the S3 URL
+    3. RAG service downloads and processes the PDF
+
+    - Request: JSON with file_url and optional file_id
+    - Response: UploadResponse with metadata
+    """
+    fid = req.file_id or str(uuid.uuid4())
+
+    # Create FileConfig with cloud URL
+    file_config = FileConfig(fid, cloud_url=req.file_url)
+
+    start = time.time()
+    try:
+        res = await build_pipeline_sync(file_config)
+        elapsed = time.time() - start
+
+        # Optionally cleanup local file to save space
+        # file_config.cleanup_local_file()
+
+        return UploadResponse(
+            message="Ingested from URL successfully",
+            file_id=fid,
+            status="completed",
+            processing_time=elapsed,
+            title=res.title,
+            abstract=res.abstract,
+            node_count=res.node_count,
+            table_count=res.table_count,
+            image_count=res.image_count,
+        )
+    except Exception as e:
+        elapsed = time.time() - start
+        status = get_status(fid) or "error"
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/query", response_model=QueryResponse)
@@ -421,7 +489,7 @@ async def brainstorm_questions(req: BrainstormRequest):
     # 3. Gọi LLM sinh câu hỏi
     # Lưu ý: Bạn có thể cache kết quả này vào METADATA_REGISTRY nếu không muốn gọi LLM nhiều lần cho cùng 1 file
     questions = brainstorm_questions_chain(
-        title=meta.title or "Unknown Title", 
+        title=meta.title or "Unknown Title",
         abstract=meta.abstract or "No abstract available."
     )
 

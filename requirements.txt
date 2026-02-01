@@ -19,4 +19,5 @@ asyncio-throttle
 pymupdf
 camelot-py[cv]
 opencv-python-headless
-arxiv 
+arxiv
+boto3  # For S3/MinIO cloud storage
