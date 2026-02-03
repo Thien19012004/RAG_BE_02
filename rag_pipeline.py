@@ -58,7 +58,7 @@ def split_docs(docs: List[Document]):
         source_id = f"S{idx}"
         metadata = doc.metadata or {}
         modality = metadata.get("modality", "text")
-        
+
         payload: Dict[str, Any] = {
             "source_id": source_id,
             "metadata": metadata,
@@ -95,23 +95,23 @@ def build_mm_prompt(kwargs: Dict[str, Any]):
 
     # 1. Determine System Instructions
     base_instruction = prompt_cfg.system_instructions or DEFAULT_RAG_INSTRUCTIONS
-    
+
     instructions = [base_instruction]
-    
+
     if prompt_cfg.paper_id and not prompt_cfg.is_visual_explanation:
         instructions.append(f"Focus on paper ID: {prompt_cfg.paper_id}.")
 
     # 2. Build Text Context
     ctx_lines: List[str] = []
-    
+
     # Merge texts and tables for context
     combined_text_items = ctx.get("texts", []) + ctx.get("tables", [])
-    
+
     # Sort: Abstracts first, then others
     def sort_key(item):
         sec = (item["metadata"].get("section_title") or "").lower()
         return 0 if "abstract" in sec else 1
-    
+
     for item in sorted(combined_text_items, key=sort_key):
         sid = item['source_id']
         section = item["metadata"].get("section_title") or "Context"
@@ -122,26 +122,26 @@ def build_mm_prompt(kwargs: Dict[str, Any]):
 
     # 3. Construct Message Content
     content = []
-    
+
     # Text Part
     text_content = (
         f"{'\n'.join(instructions)}\n\n"
         f"--- CONTEXT START ---\n{context_str}\n--- CONTEXT END ---\n\n"
         f"User Question: {question}\n"
     )
-    
+
     if focus_image_b64:
         text_content += "Note: The user has provided a specific image region to analyze below.\n"
 
     content.append({"type": "text", "text": text_content})
 
     # 4. Add Images (Context Images + Focus Image)
-    
-    # If we have a focus image (Region Explain), it usually comes LAST or FIRST. 
+
+    # If we have a focus image (Region Explain), it usually comes LAST or FIRST.
     # Let's put it last to ensure the model focuses on it.
     if focus_image_b64:
         content.append({
-            "type": "image_url", 
+            "type": "image_url",
             "image_url": {"url": f"data:image/jpeg;base64,{focus_image_b64}"}
         })
         content.append({"type": "text", "text": "Image: The cropped region to explain."})
@@ -151,7 +151,7 @@ def build_mm_prompt(kwargs: Dict[str, Any]):
         # Skip if this is the same as focus image (naive check)
         if focus_image_b64 and img_item.get("image_b64") == focus_image_b64:
             continue
-            
+
         b64 = img_item.get("image_b64")
         if b64:
             caption = img_item.get("text") or "Figure"
@@ -171,14 +171,14 @@ def build_generative_chain():
     """
     Builds the pure generation chain: Input -> Prompt -> LLM -> String.
     Input Expected: {
-        "context": Dict (from split_docs), 
-        "question": str, 
-        "prompt_cfg": PromptConfig, 
+        "context": Dict (from split_docs),
+        "question": str,
+        "prompt_cfg": PromptConfig,
         "focus_image_b64": Optional[str]
     }
     """
     final_llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.2)
-    
+
     chain = (
         RunnableLambda(build_mm_prompt)
         | final_llm
@@ -202,26 +202,26 @@ def document_retrieve(
     query_lower = query.lower()
     # Mở rộng bộ từ khóa nhận diện ý định tổng quan
     is_summary = any(x in query_lower for x in ["summary", "overview", "main idea", "summarize", "abstract", "conclusion"])
-    
+
     results: List[Document] = []
 
     if is_summary:
         # PATH A: Lấy Abstract để nắm ý chính (Bắt buộc)
         abstract_docs = backend.similarity_search(
-            query=query, 
-            k=1, 
-            collection=content_collection, 
+            query=query,
+            k=1,
+            collection=content_collection,
             where={"$and": [{"paper_id": paper_id}, {"modality": "abstract"}]}
         )
         results.extend(abstract_docs)
-        
+
         # PATH B: Lấy thêm Content để có chi tiết (Không loại trừ phần nào)
         # k giảm xuống một chút để nhường chỗ cho Abstract
         search_k = max(8, k - len(results))
         content_docs = backend.similarity_search(
-            query=query, 
-            k=search_k, 
-            collection=content_collection, 
+            query=query,
+            k=search_k,
+            collection=content_collection,
             where={"paper_id": paper_id} # Tìm toàn bộ để không sót
         )
         results.extend(content_docs)
@@ -229,9 +229,9 @@ def document_retrieve(
         # Truy vấn bình thường: Cho phép tự do tìm kiếm dựa trên độ tương đồng
         # Abstract vẫn có thể xuất hiện nếu nó thực sự liên quan đến câu hỏi
         results = backend.similarity_search(
-            query=query, 
-            k=k, 
-            collection=content_collection, 
+            query=query,
+            k=k,
+            collection=content_collection,
             where={"paper_id": paper_id}
         )
 
@@ -244,8 +244,65 @@ def document_retrieve(
         if content_key not in seen_content:
             unique_docs.append(doc)
             seen_content.add(content_key)
-            
+
     return unique_docs[:k]
+
+
+def multi_document_retrieve(
+    query: str,
+    paper_ids: List[str],
+    backend: VectorStoreBackend,
+    content_collection: str = CONTENT_COLLECTION,
+    k_per_paper: int = 6,
+    total_k: int = 15,
+) -> List[Document]:
+    """
+    Retrieve documents from multiple papers.
+
+    Strategy:
+    1. Search each paper individually to ensure coverage
+    2. Merge and re-rank results by relevance
+    3. Return top total_k results
+
+    Args:
+        query: The user's question
+        paper_ids: List of paper IDs to search across
+        backend: Vector store backend
+        k_per_paper: How many docs to retrieve per paper initially
+        total_k: Final number of docs to return after merging
+    """
+    all_docs: List[Document] = []
+
+    for paper_id in paper_ids:
+        try:
+            docs = backend.similarity_search(
+                query=query,
+                k=k_per_paper,
+                collection=content_collection,
+                where={"paper_id": paper_id}
+            )
+            # Tag each doc with its paper_id for tracking
+            for doc in docs:
+                if doc.metadata is None:
+                    doc.metadata = {}
+                doc.metadata["source_paper_id"] = paper_id
+            all_docs.extend(docs)
+        except Exception as e:
+            print(f"Error retrieving from paper {paper_id}: {e}")
+            continue
+
+    # Deduplicate by content
+    seen_content = set()
+    unique_docs = []
+    for doc in all_docs:
+        content_key = doc.page_content[:150].strip()
+        if content_key not in seen_content:
+            unique_docs.append(doc)
+            seen_content.add(content_key)
+
+    # TODO: Could add re-ranking here with a cross-encoder
+    # For now, just return top total_k docs
+    return unique_docs[:total_k]
 
 
 def build_document_rag_chain(
@@ -258,7 +315,7 @@ def build_document_rag_chain(
     Retrieval is baked in.
     """
     prompt_cfg = prompt_cfg or PromptConfig(paper_id=paper_id)
-    
+
     # 1. Retrieval Step
     def _retrieve_step(input_dict):
         q = input_dict["question"]
@@ -276,15 +333,15 @@ def build_document_rag_chain(
             "prompt_cfg": lambda _: prompt_cfg,
             "focus_image_b64": lambda _: None, # No focus image in standard query
         }
-        | gen_chain 
+        | gen_chain
         | RunnableLambda(lambda x: {"response": x}) # Wrap for compatibility
     )
-    
+
     # Inject context into output for API response
     final_chain = (
         RunnablePassthrough.assign(context=RunnableLambda(_retrieve_step))
         .assign(response=lambda x: gen_chain.invoke({
-            "context": x["context"], 
+            "context": x["context"],
             "question": x["question"],
             "prompt_cfg": prompt_cfg,
             "focus_image_b64": None
@@ -299,7 +356,7 @@ def brainstorm_questions_chain(title: str, abstract: str) -> List[str]:
     Sử dụng LLM để tạo ra các câu hỏi gợi ý dựa trên Title và Abstract.
     """
     llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.7) # Tăng temp để sáng tạo hơn
-    
+
     prompt = (
         f"You are a research expert. Based on the following research paper metadata, "
         f"suggest 5-8 thought-provoking and diverse questions that a reader should ask "
@@ -311,10 +368,10 @@ def brainstorm_questions_chain(title: str, abstract: str) -> List[str]:
         f"- Format: [\"question 1\", \"question 2\", ...]\n"
         f"- Questions should be concise and professional."
     )
-    
+
     # Sử dụng .with_structured_output nếu muốn chắc chắn về định dạng (hoặc parse tay)
     response = llm.invoke(prompt)
-    
+
     try:
         # Cố gắng parse JSON từ response
         import json

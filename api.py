@@ -23,6 +23,8 @@ from rag_pipeline import (
     brainstorm_questions_chain,
     PromptConfig,
     REGION_EXPLAIN_INSTRUCTIONS,
+    split_docs,
+    multi_document_retrieve,
 )
 from api_utils import (
     retrieve_context_for_explain,
@@ -226,6 +228,19 @@ class BrainstormRequest(BaseModel):
 class BrainstormResponse(BaseModel):
     questions: List[str]
 
+
+class MultiQueryRequest(BaseModel):
+    """Request to query across multiple PDFs."""
+    question: str
+    file_ids: List[str]  # List of file IDs to search across
+
+
+class MultiQueryResponse(BaseModel):
+    """Response from multi-PDF query."""
+    answer: str
+    context: Optional[dict] = None
+    sources: Optional[List[dict]] = None  # Which papers contributed to the answer
+
 # -----------------------------------------------------------------------------
 # Helpers
 # -----------------------------------------------------------------------------
@@ -381,6 +396,85 @@ async def query_pdf(req: QueryRequest):
     out = chain.invoke({"question": req.question})
     # rag_pipeline trả {"response": answer, "context": ctx}
     return QueryResponse(answer=out["response"], context=out.get("context"))
+
+
+@app.post("/query-multi", response_model=MultiQueryResponse)
+async def query_multi_pdf(req: MultiQueryRequest):
+    """
+    Query across multiple PDFs at once.
+
+    This endpoint allows users to ask questions that span multiple papers,
+    enabling cross-paper analysis and comparison.
+    """
+    if not req.file_ids:
+        raise HTTPException(400, "At least one file_id is required")
+
+    if len(req.file_ids) > 10:
+        raise HTTPException(400, "Maximum 10 papers can be queried at once")
+
+    # Validate all files are ready
+    paper_titles = {}
+    for file_id in req.file_ids:
+        validate_file_ready(file_id)
+        meta = load_metadata(file_id)
+        if meta:
+            paper_titles[file_id] = meta.title or f"Paper {file_id[:8]}"
+        else:
+            paper_titles[file_id] = f"Paper {file_id[:8]}"
+
+    # Retrieve documents from all papers
+    docs = multi_document_retrieve(
+        query=req.question,
+        paper_ids=req.file_ids,
+        backend=VECTOR_BACKEND,
+        k_per_paper=6,
+        total_k=15,
+    )
+
+    # Split docs into modality groups
+    context = split_docs(docs)
+
+    # Build prompt config for multi-paper query
+    paper_list = ", ".join([f'"{title}"' for title in paper_titles.values()])
+    multi_paper_instructions = (
+        f"You are analyzing multiple research papers: {paper_list}. "
+        "Use the provided context from ALL papers to answer the question. "
+        "When citing, indicate which paper the information comes from using [S1], [S2], etc. "
+        "If comparing papers, clearly distinguish findings from each source. "
+        "Synthesize information across papers when relevant."
+    )
+
+    prompt_cfg = PromptConfig(
+        paper_id=None,  # Multiple papers
+        system_instructions=multi_paper_instructions,
+    )
+
+    # Generate answer
+    gen_chain = build_generative_chain()
+    answer = gen_chain.invoke({
+        "context": context,
+        "question": req.question,
+        "prompt_cfg": prompt_cfg,
+        "focus_image_b64": None,
+    })
+
+    # Build sources info for response
+    sources = []
+    seen_papers = set()
+    for item in context.get("texts", []) + context.get("tables", []) + context.get("images", []):
+        paper_id = item.get("metadata", {}).get("source_paper_id") or item.get("metadata", {}).get("paper_id")
+        if paper_id and paper_id not in seen_papers:
+            seen_papers.add(paper_id)
+            sources.append({
+                "paper_id": paper_id,
+                "title": paper_titles.get(paper_id, f"Paper {paper_id[:8]}"),
+            })
+
+    return MultiQueryResponse(
+        answer=answer,
+        context=context,
+        sources=sources,
+    )
 
 
 @app.post("/explain-region", response_model=QueryResponse)
