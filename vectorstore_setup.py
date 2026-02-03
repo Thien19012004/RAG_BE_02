@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Protocol
+from typing import Any, Dict, List, Optional, Protocol, Tuple
 
 from langchain_chroma import Chroma
 from langchain_core.documents import Document
@@ -21,6 +21,15 @@ class VectorStoreBackend(Protocol):
         collection: str,
         where: Optional[Dict[str, Any]] = None,
     ) -> List[Document]:
+        ...
+
+    def similarity_search_with_score(
+        self,
+        query: str,
+        k: int,
+        collection: str,
+        where: Optional[Dict[str, Any]] = None,
+    ) -> List[Tuple[Document, float]]:
         ...
 
     def delete_where(self, collection: str, where: Dict[str, Any]) -> None:
@@ -65,6 +74,22 @@ class LocalChromaBackend:
         store = self._get_store(collection)
         # ChromaDB sử dụng tham số 'filter' cho siêu dữ liệu
         return store.similarity_search(query, k=k, filter=where)
+
+    def similarity_search_with_score(
+        self,
+        query: str,
+        k: int,
+        collection: str,
+        where: Optional[Dict[str, Any]] = None,
+    ) -> List[Tuple[Document, float]]:
+        """Search with relevance scores returned."""
+        store = self._get_store(collection)
+        # ChromaDB returns (doc, score) tuples
+        # Note: Chroma returns distance, lower is better. Convert to similarity (higher is better)
+        results = store.similarity_search_with_score(query, k=k, filter=where)
+        # Convert distance to similarity score (1 - normalized_distance)
+        # Chroma uses L2 distance, typical range 0-2 for normalized embeddings
+        return [(doc, 1.0 / (1.0 + score)) for doc, score in results]
 
     def delete_where(self, collection: str, where: Dict[str, Any]) -> None:
         store = self._get_store(collection)

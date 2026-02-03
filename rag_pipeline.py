@@ -255,14 +255,16 @@ def multi_document_retrieve(
     content_collection: str = CONTENT_COLLECTION,
     k_per_paper: int = 6,
     total_k: int = 15,
+    relevance_threshold: float = 0.3,
 ) -> List[Document]:
     """
-    Retrieve documents from multiple papers.
+    Retrieve documents from multiple papers with relevance-based filtering.
 
     Strategy:
-    1. Search each paper individually to ensure coverage
-    2. Merge and re-rank results by relevance
-    3. Return top total_k results
+    1. First do a global search across ALL papers to get relevance scores
+    2. Identify which papers have relevant content
+    3. Then do per-paper search only for relevant papers
+    4. Filter out low-relevance citations from unrelated papers
 
     Args:
         query: The user's question
@@ -270,38 +272,77 @@ def multi_document_retrieve(
         backend: Vector store backend
         k_per_paper: How many docs to retrieve per paper initially
         total_k: Final number of docs to return after merging
+        relevance_threshold: Minimum similarity score to include a paper's docs
     """
-    all_docs: List[Document] = []
+    all_docs_with_scores: List[tuple[Document, float]] = []
+
+    # Step 1: Search each paper and track relevance scores
+    paper_max_scores: Dict[str, float] = {}
 
     for paper_id in paper_ids:
         try:
-            docs = backend.similarity_search(
+            # Use similarity_search_with_score to get relevance scores
+            docs_with_scores = backend.similarity_search_with_score(
                 query=query,
                 k=k_per_paper,
                 collection=content_collection,
                 where={"paper_id": paper_id}
             )
-            # Tag each doc with its paper_id for tracking
-            for doc in docs:
-                if doc.metadata is None:
-                    doc.metadata = {}
-                doc.metadata["source_paper_id"] = paper_id
-            all_docs.extend(docs)
+
+            if docs_with_scores:
+                # Track max score for this paper
+                max_score = max(score for _, score in docs_with_scores)
+                paper_max_scores[paper_id] = max_score
+
+                # Tag each doc with its paper_id and score for tracking
+                for doc, score in docs_with_scores:
+                    if doc.metadata is None:
+                        doc.metadata = {}
+                    doc.metadata["source_paper_id"] = paper_id
+                    doc.metadata["relevance_score"] = score
+                    all_docs_with_scores.append((doc, score))
+
         except Exception as e:
             print(f"Error retrieving from paper {paper_id}: {e}")
             continue
 
-    # Deduplicate by content
+    if not all_docs_with_scores:
+        return []
+
+    # Step 2: Determine relevance threshold dynamically
+    # Use the best score across all papers as reference
+    all_scores = [score for _, score in all_docs_with_scores]
+    max_overall_score = max(all_scores) if all_scores else 0
+
+    # Papers with max score < 50% of best paper's max score are considered less relevant
+    dynamic_threshold = max_overall_score * relevance_threshold
+
+    # Step 3: Filter and sort documents
+    # Include all docs from relevant papers, filter out low-score docs from less relevant papers
+    filtered_docs: List[tuple[Document, float]] = []
+
+    for doc, score in all_docs_with_scores:
+        paper_id = doc.metadata.get("source_paper_id")
+        paper_max = paper_max_scores.get(paper_id, 0)
+
+        # If paper's best score is above threshold, include its docs
+        # OR if this specific doc has high relevance, include it
+        if paper_max >= dynamic_threshold or score >= dynamic_threshold:
+            filtered_docs.append((doc, score))
+
+    # Sort by score (higher is better for similarity)
+    filtered_docs.sort(key=lambda x: x[1], reverse=True)
+
+    # Step 4: Deduplicate by content
     seen_content = set()
-    unique_docs = []
-    for doc in all_docs:
+    unique_docs: List[Document] = []
+
+    for doc, score in filtered_docs:
         content_key = doc.page_content[:150].strip()
         if content_key not in seen_content:
             unique_docs.append(doc)
             seen_content.add(content_key)
 
-    # TODO: Could add re-ranking here with a cross-encoder
-    # For now, just return top total_k docs
     return unique_docs[:total_k]
 
 
