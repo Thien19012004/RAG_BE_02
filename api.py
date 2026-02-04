@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import shutil
+import tempfile
 import time
 import uuid
 from pathlib import Path
@@ -14,7 +15,7 @@ from fastapi import FastAPI, File, UploadFile, HTTPException, Form, BackgroundTa
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from config import FileConfig, CHROMA_DIR, CACHE_DIR, CONTENT_DIR, settings
+from config import FileConfig, CHROMA_DIR, settings
 from langchain_multimodal import ingest_document, IngestionResult
 from vectorstore_setup import build_local_chroma_backend
 from rag_pipeline import (
@@ -32,6 +33,13 @@ from api_utils import (
 )
 from arxiv_related import suggest_related_papers
 
+# Database module - reads from Backend's tables, manages RAG cache
+from database import (
+    get_status,
+    load_metadata,
+    get_database,
+)
+
 
 # -----------------------------------------------------------------------------
 # FastAPI app & CORS
@@ -47,117 +55,15 @@ app.add_middleware(
 )
 
 # -----------------------------------------------------------------------------
-# Global backends (in-memory) + JSON persistence
+# Global backends (in-memory)
 # -----------------------------------------------------------------------------
 VECTOR_BACKEND = build_local_chroma_backend(str(CHROMA_DIR / "global_store"))
 
-# Pipelines giữ in-memory (có thể build lại từ vector store)
+# Pipelines kept in-memory (can be rebuilt from vector store after restart)
 pipelines: Dict[str, Any] = {}
 
-# 2 dict này sẽ được "backup" xuống file JSON để sau restart vẫn còn
+# In-memory cache for metadata (for performance, backed by database)
 file_metadata: Dict[str, IngestionResult] = {}
-processing_status: Dict[str, str] = {}
-
-STATUS_REGISTRY = CACHE_DIR / "status_registry.json"
-METADATA_REGISTRY = CACHE_DIR / "metadata_registry.json"
-
-
-def _load_json(path: Path) -> Dict[str, Any]:
-    if not path.exists():
-        return {}
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return {}
-
-
-def _save_json(path: Path, data: Dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-
-
-def set_status(file_id: str, status: str) -> None:
-    """Update status in memory + persist ra STATUS_REGISTRY."""
-    processing_status[file_id] = status
-    data = _load_json(STATUS_REGISTRY)
-    data[file_id] = status
-    _save_json(STATUS_REGISTRY, data)
-
-
-def get_status(file_id: str) -> Optional[str]:
-    """Lấy status từ cache hoặc từ file JSON."""
-    if file_id in processing_status:
-        return processing_status[file_id]
-    data = _load_json(STATUS_REGISTRY)
-    status = data.get(file_id)
-    if status is not None:
-        processing_status[file_id] = status
-    return status
-
-
-def save_metadata(file_id: str, res: IngestionResult) -> None:
-    """Lưu nhẹ metadata của IngestionResult ra JSON (fake DB)."""
-    file_metadata[file_id] = res
-    data = _load_json(METADATA_REGISTRY)
-    data[file_id] = {
-        "paper_id": res.paper_id,
-        "title": res.title,
-        "abstract": res.abstract,
-        "node_count": res.node_count,
-        "table_count": res.table_count,
-        "image_count": res.image_count,
-        "metadata_path": res.metadata_path,
-    }
-    _save_json(METADATA_REGISTRY, data)
-
-
-def load_metadata(file_id: str) -> Optional[IngestionResult]:
-    """
-    Lấy IngestionResult từ cache hoặc từ file.
-    Đây đóng vai trò stand-in cho database metadata sau này.
-    """
-    if file_id in file_metadata:
-        return file_metadata[file_id]
-
-    # Thử lấy từ registry JSON
-    data = _load_json(METADATA_REGISTRY)
-    payload = data.get(file_id)
-    if payload is None:
-        # Fallback: đọc paper_metadata.json gốc trong cache/<file_id>/
-        cfg = FileConfig(file_id)
-        meta_path = cfg.cache_dir / "paper_metadata.json"
-        if not meta_path.exists():
-            return None
-        try:
-            with open(meta_path, "r", encoding="utf-8") as f:
-                meta = json.load(f)
-        except Exception:
-            return None
-        res = IngestionResult(
-            paper_id=meta.get("paper_id", file_id),
-            title=meta.get("title", ""),
-            abstract=meta.get("abstract", ""),
-            node_count=meta.get("node_count", 0),
-            table_count=meta.get("table_count", 0),
-            image_count=meta.get("image_count", 0),
-            metadata_path=str(meta_path),
-        )
-        file_metadata[file_id] = res
-        return res
-
-    res = IngestionResult(
-        paper_id=payload.get("paper_id", file_id),
-        title=payload.get("title", ""),
-        abstract=payload.get("abstract", ""),
-        node_count=payload.get("node_count", 0),
-        table_count=payload.get("table_count", 0),
-        image_count=payload.get("image_count", 0),
-        metadata_path=payload.get("metadata_path", ""),
-    )
-    file_metadata[file_id] = res
-    return res
 
 
 # -----------------------------------------------------------------------------
@@ -245,33 +151,35 @@ class MultiQueryResponse(BaseModel):
 # Helpers
 # -----------------------------------------------------------------------------
 def validate_file_ready(file_id: str) -> None:
+    """Validate that a file exists and is ready for querying."""
     status = get_status(file_id)
-    if status is None or status == "unknown":
+    if status is None:
         raise HTTPException(404, "File not found")
-    if not status.startswith("completed"):
-        # đang xử lý hoặc lỗi
-        if status.startswith("error"):
-            raise HTTPException(500, f"File processing failed: {status}")
+    if status != "completed":
+        # Currently processing or failed
+        if status == "failed":
+            raise HTTPException(500, "File processing failed")
         raise HTTPException(202, "File processing not finished")
 
 
 async def build_pipeline_sync(file_config: FileConfig) -> IngestionResult:
     """
-    Chạy ingest + build RAG chain cho 1 PDF, theo kiểu *đồng bộ*.
-    Được gọi trong /upload – chỉ trả response khi xong.
+    Run ingest + build RAG chain for a PDF synchronously.
+    Called by /upload and /ingest-from-url - only returns when complete.
+
+    Note: Backend updates paper status in `papers` table.
+    RAG only stores file hash in `rag_paper_cache` for rebuild detection.
 
     Returns:
         IngestionResult with metadata from ingestion
     """
     try:
-        set_status(file_config.file_id, "processing")
-
-        # Ensure file is downloaded if from cloud
+        # Ensure file is downloaded if from cloud (to temp location)
         file_config.ensure_local_file()
 
         res = await ingest_document(file_config, VECTOR_BACKEND)
 
-        # Build query chain chuẩn
+        # Build query chain
         prompt_cfg = PromptConfig(
             paper_id=file_config.file_id,
             paper_title=res.title,
@@ -279,13 +187,19 @@ async def build_pipeline_sync(file_config: FileConfig) -> IngestionResult:
         chain = build_document_rag_chain(file_config.file_id, VECTOR_BACKEND, prompt_cfg)
 
         pipelines[file_config.file_id] = chain
-        save_metadata(file_config.file_id, res)
-        set_status(file_config.file_id, "completed")
+
+        # Save file hash for rebuild detection (RAG's cache)
+        db = get_database()
+        db.save_file_hash(file_config.file_id, file_config.get_file_hash())
+
+        # Cleanup temporary local file after successful processing
+        file_config.cleanup_local_file()
 
         return res
     except Exception as e:
         print(f"Error while building pipeline for {file_config.file_id}: {e}")
-        set_status(file_config.file_id, f"error: {str(e)}")
+        # Cleanup on error too
+        file_config.cleanup_local_file()
         raise
 
 
@@ -298,16 +212,22 @@ async def upload_pdf(
     file_id: Optional[str] = Form(None),
 ):
     """
-    Upload PDF và build pipeline *đồng bộ*.
+    Upload PDF and build pipeline synchronously.
 
-    - Request: multipart/form-data với file + optional file_id
-    - Response: UploadResponse(message, file_id, status, processing_time, metadata)
+    NOTE: This endpoint is primarily for development/testing.
+    In production, use /ingest-from-url with cloud storage.
+
+    - Request: multipart/form-data with file + optional file_id
+    - Response: UploadResponse with metadata
     """
     fid = file_id or str(uuid.uuid4())
+
+    # Create FileConfig - will use temp directory for processing
     file_config = FileConfig(fid)
 
-    # Lưu file vào local (original behavior)
-    with open(file_config._local_pdf_path, "wb") as buffer:
+    # Save uploaded file to temp location for processing
+    temp_path = file_config.get_temp_pdf_path()
+    with open(temp_path, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
 
     start = time.time()
@@ -337,10 +257,10 @@ async def ingest_from_url(req: IngestFromUrlRequest):
     """
     Ingest a PDF from a cloud URL (S3/MinIO).
 
-    This endpoint is designed for Backend integration:
+    This is the RECOMMENDED endpoint for production:
     1. Backend uploads PDF to S3
     2. Backend calls this endpoint with the S3 URL
-    3. RAG service downloads and processes the PDF
+    3. RAG service downloads, processes, and cleans up the local file
 
     - Request: JSON with file_url and optional file_id
     - Response: UploadResponse with metadata
@@ -354,9 +274,6 @@ async def ingest_from_url(req: IngestFromUrlRequest):
     try:
         res = await build_pipeline_sync(file_config)
         elapsed = time.time() - start
-
-        # Optionally cleanup local file to save space
-        # file_config.cleanup_local_file()
 
         return UploadResponse(
             message="Ingested from URL successfully",
@@ -597,6 +514,87 @@ async def get_file_status(file_id: str):
         "status": status,
         "ready": file_id in pipelines and status.startswith("completed"),
     }
+
+
+@app.delete("/cleanup/{file_id}")
+async def cleanup_file(file_id: str):
+    """
+    Cleanup all RAG data for a file.
+    Called by Backend when a paper is deleted.
+
+    Cleans up:
+    - In-memory pipeline cache
+    - rag_paper_cache table entry
+    - paper_content_summaries table entries
+    - ChromaDB vector store (optional, for disk space)
+    """
+    import shutil
+
+    cleaned = {
+        "pipeline_cache": False,
+        "rag_paper_cache": False,
+        "content_summaries": False,
+        "vector_store": False,
+    }
+
+    # 1. Remove from in-memory pipeline cache
+    if file_id in pipelines:
+        del pipelines[file_id]
+        cleaned["pipeline_cache"] = True
+
+    # 2. Remove from in-memory metadata cache
+    if file_id in file_metadata:
+        del file_metadata[file_id]
+
+    # 3. Cleanup database tables
+    try:
+        db = get_database()
+
+        # Delete from paper_content_summaries
+        db.delete_summaries(file_id)
+        cleaned["content_summaries"] = True
+
+        # Delete from rag_paper_cache
+        db.delete_paper_cache(file_id)
+        cleaned["rag_paper_cache"] = True
+    except Exception as e:
+        print(f"❌ Database cleanup failed for {file_id}: {e}")
+
+    # 4. Delete ChromaDB vector store directory (optional, saves disk space)
+    try:
+        chroma_path = CHROMA_DIR / file_id
+        if chroma_path.exists():
+            shutil.rmtree(chroma_path)
+            cleaned["vector_store"] = True
+    except Exception as e:
+        print(f"❌ ChromaDB cleanup failed for {file_id}: {e}")
+
+    print(f"🧹 Cleanup completed for {file_id}: {cleaned}")
+    return {"file_id": file_id, "cleaned": cleaned}
+
+
+@app.get("/cleanup/orphaned-guests")
+async def get_orphaned_guest_files(max_age_hours: int = 24):
+    """
+    Get list of orphaned guest files (exist in rag_paper_cache but not in papers).
+    Used by Backend cleanup cron job.
+    """
+    try:
+        db = get_database()
+        orphaned_ids = db.get_orphaned_guest_files(max_age_hours)
+
+        # Note: We don't have file URLs in rag_paper_cache
+        # Backend will need to handle S3 cleanup separately or we need to enhance this
+        files = [{"rag_paper_id": fid} for fid in orphaned_ids]
+
+        return {
+            "count": len(files),
+            "max_age_hours": max_age_hours,
+            "files": files,
+        }
+    except Exception as e:
+        print(f"❌ Failed to get orphaned guest files: {e}")
+        raise HTTPException(500, f"Failed to get orphaned files: {str(e)}")
 
 
 if __name__ == "__main__":
