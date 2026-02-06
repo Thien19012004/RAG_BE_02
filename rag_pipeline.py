@@ -28,7 +28,19 @@ DEFAULT_RAG_INSTRUCTIONS = (
     "Use ONLY the provided context to answer. Synthesize information from multiple sources when needed. "
     "If asked for a summary, combine information to create a comprehensive answer. "
     "Keep answers concise and cite sources as [S1], [S2], etc. "
-    "Ground every claim in the context."
+    "Ground every claim in the context.\n\n"
+    "CRITICAL LaTeX Formatting Rules (MUST follow exactly):\n"
+    "- For inline math, use single dollar signs: $E = mc^2$\n"
+    "- For block/display math, use double dollar signs on their own lines:\n"
+    "$$\n"
+    "\\frac{a}{b} = c\n"
+    "$$\n"
+    "- Always use backslash for LaTeX commands: \\frac, \\sum, \\int, \\sqrt, \\alpha, \\beta\n"
+    "- ALWAYS close every math delimiter: if you open $, you must close with $\n"
+    "- Use \\text{} for words inside math: $P(\\text{event}) = 0.5$\n"
+    "- Fractions: \\frac{numerator}{denominator}\n"
+    "- Subscripts: x_i or x_{ij}, Superscripts: x^2 or x^{n+1}\n"
+    "- DO NOT leave unbalanced $ signs in your response"
 )
 
 REGION_EXPLAIN_INSTRUCTIONS = (
@@ -39,7 +51,20 @@ REGION_EXPLAIN_INSTRUCTIONS = (
     "   - Formulas: Define symbols, explain terms/intuition. "
     "   - Tables: Describe columns, units, trends. "
     "   - Plots: Describe axes, variables, insights. "
-    "3. Use the provided Textual Context to reduce hallucination. Cite it if helpful."
+    "3. Use the provided Textual Context to reduce hallucination. Cite it if helpful.\n\n"
+    "CRITICAL LaTeX Formatting Rules (MUST follow exactly):\n"
+    "- For inline math, use single dollar signs: $E = mc^2$\n"
+    "- For block/display math, use double dollar signs on their own lines:\n"
+    "$$\n"
+    "\\int_{a}^{b} f(x) dx\n"
+    "$$\n"
+    "- Use backslash for all LaTeX commands: \\frac, \\sum, \\int, \\sqrt, \\alpha, \\beta, \\theta\n"
+    "- ALWAYS balance math delimiters: every $ must have a closing $\n"
+    "- Define each variable after equations: 'where $x$ represents...'\n"
+    "- Fractions: \\frac{a}{b}, Roots: \\sqrt{x}, \\sqrt[n]{x}\n"
+    "- Sums: \\sum_{i=1}^{n}, Products: \\prod_{i=1}^{n}\n"
+    "- Integrals: \\int_{a}^{b}, Limits: \\lim_{x \\to \\infty}\n"
+    "- DO NOT leave unbalanced $ signs"
 )
 
 

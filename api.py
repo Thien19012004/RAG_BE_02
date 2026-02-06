@@ -358,7 +358,16 @@ async def query_multi_pdf(req: MultiQueryRequest):
         "Use the provided context from ALL papers to answer the question. "
         "When citing, indicate which paper the information comes from using [S1], [S2], etc. "
         "If comparing papers, clearly distinguish findings from each source. "
-        "Synthesize information across papers when relevant."
+        "Synthesize information across papers when relevant.\n\n"
+        "CRITICAL LaTeX Formatting Rules:\n"
+        "- For inline math, use single dollar signs: $E = mc^2$\n"
+        "- For block/display math, use double dollar signs on separate lines:\n"
+        "$$\n"
+        "\\int_{-\\infty}^{\\infty} e^{-x^2} dx = \\sqrt{\\pi}\n"
+        "$$\n"
+        "- Always use proper LaTeX commands with backslash: \\frac, \\sum, \\int\n"
+        "- Ensure all math delimiters are properly balanced (every $ has a matching $)\n"
+        "- Use \\text{} for text inside math mode"
     )
 
     prompt_cfg = PromptConfig(
