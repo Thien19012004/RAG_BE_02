@@ -93,6 +93,8 @@ class UploadResponse(BaseModel):
     processing_time: Optional[float] = None
     title: Optional[str] = None
     abstract: Optional[str] = None
+    authors: Optional[List[str]] = None  # List of author names
+    num_pages: Optional[int] = None  # Total page count
     node_count: Optional[int] = None
     table_count: Optional[int] = None
     image_count: Optional[int] = None
@@ -242,6 +244,8 @@ async def upload_pdf(
             processing_time=elapsed,
             title=res.title,
             abstract=res.abstract,
+            authors=res.authors,
+            num_pages=res.num_pages,
             node_count=res.node_count,
             table_count=res.table_count,
             image_count=res.image_count,
@@ -282,6 +286,8 @@ async def ingest_from_url(req: IngestFromUrlRequest):
             processing_time=elapsed,
             title=res.title,
             abstract=res.abstract,
+            authors=res.authors,
+            num_pages=res.num_pages,
             node_count=res.node_count,
             table_count=res.table_count,
             image_count=res.image_count,

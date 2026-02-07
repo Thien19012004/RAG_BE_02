@@ -50,6 +50,8 @@ class IngestionResult:
     paper_id: str
     title: str
     abstract: str
+    authors: List[str]  # List of author names extracted from PDF
+    num_pages: int  # Total number of pages in the PDF
     node_count: int
     table_count: int
     image_count: int
@@ -88,6 +90,20 @@ def _overlap_score(a_words: List[str], b_words: List[str]) -> float:
     a_set, b_set = set(a_words), set(b_words)
     inter = len(a_set & b_set)
     return inter / max(1, len(a_set))
+
+
+def _get_pdf_page_count(pdf_path: str) -> int:
+    """Get the number of pages in a PDF using PyMuPDF."""
+    try:
+        import fitz
+        doc = fitz.open(pdf_path)
+        page_count = len(doc)
+        doc.close()
+        return page_count
+    except Exception as e:
+        print(f"⚠️ [PIPELINE] Failed to get page count: {e}")
+        return 0
+
 
 async def ingest_document(file_config, backend: VectorStoreBackend) -> IngestionResult:
     """Ingest a PDF into the abstract/content stores while keeping caches updated."""
@@ -248,6 +264,11 @@ async def ingest_document(file_config, backend: VectorStoreBackend) -> Ingestion
     backend.add_documents(documents, CONTENT_COLLECTION)
     print(f"📦 [PIPELINE] Added {len(documents)} docs to content collection")
 
+    # -------------------------------------------------------------------------
+    # 5.5) Get page count from PDF
+    # -------------------------------------------------------------------------
+    num_pages = _get_pdf_page_count(pdf_path_str)
+    print(f"📄 [PIPELINE] PDF has {num_pages} pages")
 
     # -------------------------------------------------------------------------
     # 6) Save hash to database (for detecting file changes on re-ingestion)
@@ -261,6 +282,8 @@ async def ingest_document(file_config, backend: VectorStoreBackend) -> Ingestion
         paper_id=file_config.file_id,
         title=grobid_payload.title,
         abstract=abstract_text,
+        authors=grobid_payload.authors,  # Pass authors from GROBID extraction
+        num_pages=num_pages,  # Pass page count from PyMuPDF
         node_count=len(nodes),
         table_count=len(table_blocks),
         image_count=len(image_blocks),
