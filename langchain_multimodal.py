@@ -2,9 +2,14 @@
 """
 Document ingestion pipeline responsible for:
 - dual extraction (GROBID text + PyMuPDF/Camelot layout)
-- multimodal summarization with caching
+- multimodal summarization with database caching
 - semantic node construction
 - writing abstract/content docs into the configured vector backend
+
+ARCHITECTURE NOTE:
+- All caching is now done via PostgreSQL database (database.py)
+- No local file storage is used for metadata or summaries
+- Only ChromaDB uses local storage for vector embeddings
 """
 import asyncio
 import re
@@ -36,25 +41,21 @@ from vectorstore_setup import (
     VectorStoreBackend,
     get_embedding_model,
 )
+from database import get_database
 
 
 @dataclass
 class IngestionResult:
+    """Result of document ingestion - returned to API layer."""
     paper_id: str
     title: str
     abstract: str
+    authors: List[str]  # List of author names extracted from PDF
+    num_pages: int  # Total number of pages in the PDF
     node_count: int
     table_count: int
     image_count: int
-    metadata_path: str
-
-
-def _save_metadata(cache_dir, payload: Dict[str, Any]) -> str:
-    cache_dir.mkdir(exist_ok=True, parents=True)
-    meta_path = cache_dir / "paper_metadata.json"
-    with open(meta_path, "w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2)
-    return str(meta_path)
+    metadata_path: str = ""  # Deprecated - kept for backward compatibility
 
 
 def _sanitize_metadata(meta: Dict[str, Any]) -> Dict[str, Any]:
@@ -90,6 +91,20 @@ def _overlap_score(a_words: List[str], b_words: List[str]) -> float:
     inter = len(a_set & b_set)
     return inter / max(1, len(a_set))
 
+
+def _get_pdf_page_count(pdf_path: str) -> int:
+    """Get the number of pages in a PDF using PyMuPDF."""
+    try:
+        import fitz
+        doc = fitz.open(pdf_path)
+        page_count = len(doc)
+        doc.close()
+        return page_count
+    except Exception as e:
+        print(f"⚠️ [PIPELINE] Failed to get page count: {e}")
+        return 0
+
+
 async def ingest_document(file_config, backend: VectorStoreBackend) -> IngestionResult:
     """Ingest a PDF into the abstract/content stores while keeping caches updated."""
     print(f"🔧 [PIPELINE] Start ingest for paper_id={file_config.file_id}")
@@ -111,7 +126,7 @@ async def ingest_document(file_config, backend: VectorStoreBackend) -> Ingestion
         grobid_payload, layout_blocks, table_blocks, image_blocks = await asyncio.gather(
             f_grobid, f_layout, f_tables, f_images
         )
-        
+
     print(
         f"🧠 [PIPELINE] GROBID sections={len(grobid_payload.sections)} "
         f"title={grobid_payload.title}"
@@ -139,19 +154,24 @@ async def ingest_document(file_config, backend: VectorStoreBackend) -> Ingestion
 
     # -------------------------------------------------------------------------
     # 3) Multimodal summarization (only tables + images). Text nodes keep raw text.
+    #    Uses database caching instead of local JSON files
     # -------------------------------------------------------------------------
     text_summarizer = build_text_summarizer()
     vision_summarizer = build_vision_summarizer()
 
     table_task = summarize_texts_parallel(
         [tbl.plaintext for tbl in table_blocks],
-        str(file_config.cache_dir / "table_summaries.json"),
-        text_summarizer, use_cache=not need_rebuild
+        file_config.file_id,  # Pass paper_id for database caching
+        "table",  # Content type for database caching
+        text_summarizer,
+        use_cache=not need_rebuild
     )
     image_task = summarize_images_parallel(
         [img.image_b64 for img in image_blocks],
-        str(file_config.cache_dir / "image_summaries.json"),
-        vision_summarizer, use_cache=not need_rebuild
+        file_config.file_id,  # Pass paper_id for database caching
+        "image",  # Content type for database caching
+        vision_summarizer,
+        use_cache=not need_rebuild
     )
     table_summaries, image_summaries = await asyncio.gather(table_task, image_task)
     print(
@@ -180,7 +200,7 @@ async def ingest_document(file_config, backend: VectorStoreBackend) -> Ingestion
             if score > best_score:
                 best_score = score
                 abstract_page, abstract_bbox = blk.page_number, blk.bbox
-        
+
         if best_score < 0.2: abstract_page = 1
 
         abs_meta = _sanitize_metadata({
@@ -244,29 +264,27 @@ async def ingest_document(file_config, backend: VectorStoreBackend) -> Ingestion
     backend.add_documents(documents, CONTENT_COLLECTION)
     print(f"📦 [PIPELINE] Added {len(documents)} docs to content collection")
 
+    # -------------------------------------------------------------------------
+    # 5.5) Get page count from PDF
+    # -------------------------------------------------------------------------
+    num_pages = _get_pdf_page_count(pdf_path_str)
+    print(f"📄 [PIPELINE] PDF has {num_pages} pages")
 
     # -------------------------------------------------------------------------
-    # 6) Cache metadata + hash
+    # 6) Save hash to database (for detecting file changes on re-ingestion)
     # -------------------------------------------------------------------------
     file_config.save_hash(pdf_hash)
 
-    metadata_payload = {
-        "paper_id": file_config.file_id,
-        "title": grobid_payload.title,
-        "authors": grobid_payload.authors,
-        "abstract": abstract_text,
-        "node_count": len(nodes),
-        "table_count": len(table_blocks),
-        "image_count": len(image_blocks),
-    }
-    metadata_path = _save_metadata(file_config.cache_dir, metadata_payload)
+    # Note: Metadata is saved to database by api.py via save_metadata()
+    # This keeps the ingestion layer decoupled from persistence details
 
     return IngestionResult(
         paper_id=file_config.file_id,
         title=grobid_payload.title,
         abstract=abstract_text,
+        authors=grobid_payload.authors,  # Pass authors from GROBID extraction
+        num_pages=num_pages,  # Pass page count from PyMuPDF
         node_count=len(nodes),
         table_count=len(table_blocks),
         image_count=len(image_blocks),
-        metadata_path=metadata_path,
     )

@@ -173,20 +173,65 @@ def parse_grobid_tei(tei_xml: str, pdf_path: str, paper_id: str) -> GrobidText:
     title = title_nodes[0].strip() if title_nodes else Path(pdf_path).stem
 
     # -------- Authors --------
-    author_nodes = root.xpath(
-        "//tei:teiHeader//tei:titleStmt//tei:author//tei:persName//text()",
+    # GROBID stores authors in sourceDesc/biblStruct/analytic/author, not in titleStmt
+    # Each author has persName with forename(s) and surname
+    authors: List[str] = []
+
+    # Primary location: sourceDesc > biblStruct > analytic > author
+    author_elements = root.xpath(
+        "//tei:teiHeader//tei:sourceDesc//tei:biblStruct//tei:analytic//tei:author",
         namespaces=ns,
     )
-    authors: List[str] = []
-    if author_nodes:
-        raw = " ".join(a.strip() for a in author_nodes if a.strip())
-        authors = [raw]
-    else:
-        simple_authors = root.xpath(
-            "//tei:teiHeader//tei:titleStmt//tei:author//text()", namespaces=ns
+
+    # Fallback: try titleStmt if sourceDesc is empty
+    if not author_elements:
+        author_elements = root.xpath(
+            "//tei:teiHeader//tei:titleStmt//tei:author",
+            namespaces=ns,
         )
-        if simple_authors:
-            authors = [" ".join(a.strip() for a in simple_authors if a.strip())]
+
+    for author_el in author_elements:
+        # Try to get structured name (forename + surname)
+        forenames = author_el.xpath(".//tei:persName//tei:forename//text()", namespaces=ns)
+        surnames = author_el.xpath(".//tei:persName//tei:surname//text()", namespaces=ns)
+
+        if forenames or surnames:
+            # Combine forenames and surnames
+            name_parts = []
+            for fn in forenames:
+                fn_text = fn.strip()
+                if fn_text:
+                    name_parts.append(fn_text)
+            for sn in surnames:
+                sn_text = sn.strip()
+                if sn_text:
+                    name_parts.append(sn_text)
+
+            if name_parts:
+                full_name = " ".join(name_parts)
+                authors.append(full_name)
+        else:
+            # Fallback: get all text from persName
+            persname_texts = author_el.xpath(".//tei:persName//text()", namespaces=ns)
+            if persname_texts:
+                name = " ".join(t.strip() for t in persname_texts if t.strip())
+                if name:
+                    authors.append(name)
+            else:
+                # Last fallback: get any text from author element
+                author_texts = author_el.xpath(".//text()", namespaces=ns)
+                name = " ".join(t.strip() for t in author_texts if t.strip())
+                if name:
+                    authors.append(name)
+
+    # Remove duplicates while preserving order
+    seen = set()
+    unique_authors = []
+    for author in authors:
+        if author not in seen:
+            seen.add(author)
+            unique_authors.append(author)
+    authors = unique_authors
 
     # -------- Abstract --------
     abstract_nodes = root.xpath("//tei:profileDesc//tei:abstract//text()", namespaces=ns)
@@ -246,6 +291,8 @@ def parse_grobid_tei(tei_xml: str, pdf_path: str, paper_id: str) -> GrobidText:
     if not abstract and sections:
         abstract = sections[0].text[:500]
 
+    print(f"📝 [GROBID] Extracted {len(authors)} authors: {authors[:3]}{'...' if len(authors) > 3 else ''}")
+
     return GrobidText(
         paper_id=paper_id,
         title=title,
@@ -285,6 +332,184 @@ def run_grobid(pdf_path: str, paper_id: str) -> GrobidText:
     return _fallback_parse(pdf_path, paper_id)
 
 
+def _extract_title_from_first_page(doc) -> Optional[str]:
+    """
+    Extract title from first page using heuristics:
+    - Find text blocks with largest font size in top 1/3 of page
+    - Title is usually the largest text near the top
+    """
+    try:
+        first_page = doc[0]
+        blocks = first_page.get_text("dict")["blocks"]
+
+        candidates = []
+        page_height = first_page.rect.height
+
+        for block in blocks:
+            if block.get("type") != 0:  # Skip non-text blocks
+                continue
+
+            for line in block.get("lines", []):
+                for span in line.get("spans", []):
+                    text = span.get("text", "").strip()
+                    font_size = span.get("size", 0)
+                    bbox = span.get("bbox", [0, 0, 0, 0])
+                    y_pos = bbox[1]
+
+                    # Only consider text in top 1/3 of page with reasonable length
+                    if y_pos < page_height / 3 and 10 < len(text) < 300:
+                        candidates.append({
+                            "text": text,
+                            "font_size": font_size,
+                            "y_pos": y_pos
+                        })
+
+        if not candidates:
+            return None
+
+        # Sort by font size (descending), then by y position (ascending)
+        candidates.sort(key=lambda x: (-x["font_size"], x["y_pos"]))
+
+        # Get the largest font text as title
+        title_text = candidates[0]["text"]
+
+        # Clean up: remove extra whitespace
+        title_text = " ".join(title_text.split())
+
+        # Validate: title should be reasonable
+        if len(title_text) < 5 or title_text.isdigit():
+            return None
+
+        return title_text
+
+    except Exception:
+        return None
+
+
+def _extract_authors_from_first_page(doc, title_text: Optional[str] = None) -> List[str]:
+    """
+    Extract authors from first page using heuristics:
+    - Authors are typically below the title
+    - Smaller font than title but larger than body text
+    - In the top half of the first page
+    - Often contains names (capitalized words, commas)
+    """
+    import re
+
+    try:
+        first_page = doc[0]
+        blocks = first_page.get_text("dict")["blocks"]
+
+        candidates = []
+        page_height = first_page.rect.height
+        title_font_size = 0
+        title_y_pos = 0
+
+        # First pass: find title font size and position
+        for block in blocks:
+            if block.get("type") != 0:
+                continue
+            for line in block.get("lines", []):
+                for span in line.get("spans", []):
+                    text = span.get("text", "").strip()
+                    if title_text and text and title_text.startswith(text[:20]):
+                        title_font_size = span.get("size", 0)
+                        title_y_pos = span.get("bbox", [0, 0, 0, 0])[3]  # bottom of title
+                        break
+
+        # Second pass: find author candidates
+        for block in blocks:
+            if block.get("type") != 0:
+                continue
+
+            for line in block.get("lines", []):
+                for span in line.get("spans", []):
+                    text = span.get("text", "").strip()
+                    font_size = span.get("size", 0)
+                    bbox = span.get("bbox", [0, 0, 0, 0])
+                    y_pos = bbox[1]
+
+                    # Skip if empty or too short
+                    if not text or len(text) < 3:
+                        continue
+
+                    # Authors should be in top half of page
+                    if y_pos > page_height / 2:
+                        continue
+
+                    # Authors should be below title (if we found it)
+                    if title_y_pos > 0 and y_pos < title_y_pos:
+                        continue
+
+                    # Authors font should be smaller than title
+                    if title_font_size > 0 and font_size >= title_font_size:
+                        continue
+
+                    # Skip common non-author text
+                    lower_text = text.lower()
+                    skip_keywords = ['abstract', 'introduction', 'keywords', 'arxiv',
+                                    'university', 'department', 'institute', 'school',
+                                    'email', '@', 'http', 'www', 'doi:', 'copyright']
+                    if any(kw in lower_text for kw in skip_keywords):
+                        continue
+
+                    # Look for name-like patterns (capitalized words)
+                    # Names often have: First Last, First M. Last, etc.
+                    words = text.split()
+                    if len(words) >= 2:
+                        # Check if looks like names (mostly capitalized words)
+                        cap_count = sum(1 for w in words if w and w[0].isupper())
+                        if cap_count >= len(words) * 0.5:
+                            candidates.append({
+                                "text": text,
+                                "font_size": font_size,
+                                "y_pos": y_pos
+                            })
+
+        if not candidates:
+            return []
+
+        # Sort by y position (top to bottom), then by font size
+        candidates.sort(key=lambda x: (x["y_pos"], -x["font_size"]))
+
+        # Extract author names
+        authors = []
+        for c in candidates[:5]:  # Limit to first 5 to avoid noise
+            text = c["text"]
+
+            # Split by common delimiters
+            # Authors might be "John Doe, Jane Smith" or "John Doe and Jane Smith"
+            text = re.sub(r'\s+and\s+', ', ', text, flags=re.IGNORECASE)
+            text = re.sub(r'\s*,\s*', ', ', text)
+
+            parts = [p.strip() for p in text.split(',')]
+            for part in parts:
+                # Clean up the name
+                name = part.strip()
+                # Remove footnote markers like *, 1, 2, †
+                name = re.sub(r'[*†‡§¶\d]+$', '', name).strip()
+                name = re.sub(r'^[*†‡§¶\d]+', '', name).strip()
+
+                if len(name) >= 3 and not name.isdigit():
+                    # Verify it looks like a name (at least one capital letter)
+                    if any(c.isupper() for c in name):
+                        authors.append(name)
+
+        # Remove duplicates
+        seen = set()
+        unique = []
+        for a in authors:
+            if a not in seen:
+                seen.add(a)
+                unique.append(a)
+
+        return unique[:10]  # Limit to 10 authors max
+
+    except Exception as e:
+        print(f"⚠️ Author extraction failed: {e}")
+        return []
+
+
 def _fallback_parse(pdf_path: str, paper_id: str) -> GrobidText:
     """Very lightweight PDF -> section text parser used when GROBID is unavailable."""
     try:
@@ -305,10 +530,20 @@ def _fallback_parse(pdf_path: str, paper_id: str) -> GrobidText:
                     page_end=idx + 1,
                 )
             )
+
+        # Try to extract title from first page using font heuristics
+        extracted_title = _extract_title_from_first_page(doc)
+
+        # Try to extract authors from first page
+        extracted_authors = _extract_authors_from_first_page(doc, extracted_title)
+
+        print(f"📝 [FALLBACK] Extracted title: {extracted_title[:50] if extracted_title else 'None'}...")
+        print(f"📝 [FALLBACK] Extracted {len(extracted_authors)} authors: {extracted_authors[:3]}{'...' if len(extracted_authors) > 3 else ''}")
+
         return GrobidText(
             paper_id=paper_id,
-            title=Path(pdf_path).stem,
-            authors=[],
+            title=extracted_title,  # None if extraction failed, let backend handle display
+            authors=extracted_authors,
             abstract=sections[0].text[:500] if sections else "",
             sections=sections,
         )
@@ -316,7 +551,7 @@ def _fallback_parse(pdf_path: str, paper_id: str) -> GrobidText:
         print(f"⚠️ PyMuPDF fallback failed ({exc}); using empty sections.")
         return GrobidText(
             paper_id=paper_id,
-            title=Path(pdf_path).stem,
+            title=None,  # None instead of filename to avoid showing ragFileId
             authors=[],
             abstract="",
             sections=[],

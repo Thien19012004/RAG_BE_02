@@ -2,7 +2,7 @@
 
 <div align="center">
 
-![Version](https://img.shields.io/badge/version-2.2.0-blue.svg)
+![Version](https://img.shields.io/badge/version-3.0.0-blue.svg)
 ![Python](https://img.shields.io/badge/python-3.10+-green.svg)
 ![FastAPI](https://img.shields.io/badge/FastAPI-0.100+-009688.svg)
 ![License](https://img.shields.io/badge/license-MIT-orange.svg)
@@ -31,21 +31,26 @@ RAG Scientific là một service xử lý và phân tích tài liệu PDF khoa h
 | 🔍 **Multimodal RAG**      | Kết hợp text, table, image để trả lời câu hỏi toàn diện |
 | 📊 **GROBID Integration**  | Trích xuất metadata khoa học (title, abstract, authors) |
 | 🧠 **Semantic Chunking**   | Chia nhỏ văn bản theo ngữ nghĩa, không cắt giữa câu     |
-| 💾 **Smart Caching**       | Cache summaries và embeddings, tránh xử lý lại          |
-| ☁️ **Cloud Storage**       | Hỗ trợ S3/MinIO cho production deployment               |
+| 💾 **Database Caching**    | PostgreSQL-based caching, cloud-ready architecture      |
+| ☁️ **Cloud Storage**       | S3/MinIO for PDFs, no local file dependency             |
 | 🔗 **arXiv Integration**   | Gợi ý papers liên quan từ arXiv                         |
 | 🤖 **Question Brainstorm** | AI tự động đề xuất câu hỏi hay về paper                 |
 
 ## 🏗 Architecture
 
+### Cloud-Native Design (v3.0)
+
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │                         Client (NestJS BE)                       │
+│                      (owns users, papers, chats)                 │
 └─────────────────────────────────────────────────────────────────┘
+                                │
+                    REST API (rag_file_id linking)
                                 │
                                 ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│                      FastAPI Application                         │
+│                      FastAPI Application (RAG_BE_02)             │
 │  ┌─────────────┐ ┌─────────────┐ ┌─────────────┐ ┌────────────┐ │
 │  │   /upload   │ │   /query    │ │/query-multi │ │ /brainstorm│ │
 │  │ /ingest-url │ │/explain-reg.│ │/related-pap.│ │  /status   │ │
@@ -54,39 +59,57 @@ RAG Scientific là một service xử lý và phân tích tài liệu PDF khoa h
           │               │               │              │
           ▼               ▼               ▼              ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│                       RAG Pipeline                               │
+│                     Persistence Layer                            │
 │  ┌───────────────┐  ┌───────────────┐  ┌───────────────────────┐│
-│  │ PDF Extractor │  │  Summarizer   │  │   Vector Store        ││
-│  │   (PyMuPDF)   │  │ (Groq/OpenAI) │  │    (ChromaDB)         ││
-│  │   + GROBID    │  │               │  │                       ││
-│  └───────┬───────┘  └───────┬───────┘  └───────────┬───────────┘│
-│          │                  │                      │            │
-│          └──────────────────┴──────────────────────┘            │
-│                             │                                   │
-│                             ▼                                   │
-│  ┌─────────────────────────────────────────────────────────────┐│
-│  │                   LLM Generation Chain                      ││
-│  │         (Groq LLaMA / OpenAI GPT-4o for vision)            ││
-│  └─────────────────────────────────────────────────────────────┘│
+│  │  PostgreSQL   │  │  S3/Cloud     │  │      ChromaDB         ││
+│  │  (metadata,   │  │  Storage      │  │   (vector index)      ││
+│  │   summaries)  │  │  (PDFs)       │  │                       ││
+│  └───────────────┘  └───────────────┘  └───────────────────────┘│
+│         ▲                  ▲                     ▲              │
+│         │                  │                     │              │
+│         └──────────────────┴─────────────────────┘              │
+│                    NO LOCAL FILE STORAGE                         │
 └─────────────────────────────────────────────────────────────────┘
 ```
+
+### Database Tables (RAG Service Owned)
+
+| Table                     | Purpose                                    |
+| ------------------------- | ------------------------------------------ |
+| `ingested_papers`         | Paper status, metadata, file hash tracking |
+| `paper_content_summaries` | Cached LLM summaries for tables/images     |
+
+### Single Source of Truth
+
+| Data              | Owner                      | Table/Field                        |
+| ----------------- | -------------------------- | ---------------------------------- |
+| PDF Cloud URL     | NestJS (rag-scientific-be) | `papers.file_url`                  |
+| Ingestion Status  | RAG_BE_02                  | `ingested_papers.ingestion_status` |
+| Paper Metadata    | RAG_BE_02                  | `ingested_papers.*`                |
+| LLM Summaries     | RAG_BE_02                  | `paper_content_summaries`          |
+| Vector Embeddings | RAG_BE_02                  | ChromaDB (`chroma_store/`)         |
 
 ### Data Flow
 
 ```
-PDF Upload → GROBID Parse → Extract (Text/Table/Image)
-                                    │
-                                    ▼
-                            Parallel Summarization
-                                    │
-                                    ▼
-                            Embedding Generation
-                                    │
-                                    ▼
-                            ChromaDB Storage
-                                    │
-                                    ▼
-                            Ready for Query ✓
+PDF (S3) → Download to Temp → GROBID Parse → Extract (Text/Table/Image)
+                                                    │
+                                                    ▼
+                                            Parallel Summarization
+                                                    │
+                                                    ▼
+                        ┌───────────────────────────┴───────────────────────────┐
+                        │                                                       │
+                        ▼                                                       ▼
+                PostgreSQL                                               ChromaDB
+            (metadata + summaries)                                    (embeddings)
+                        │                                                       │
+                        └───────────────────────────┬───────────────────────────┘
+                                                    ▼
+                                        Cleanup Temp File
+                                                    │
+                                                    ▼
+                                            Ready for Query ✓
 ```
 
 ## 🚀 Installation
@@ -94,6 +117,7 @@ PDF Upload → GROBID Parse → Extract (Text/Table/Image)
 ### Prerequisites
 
 - Python 3.10+
+- PostgreSQL 14+
 - [GROBID Server](https://github.com/kermitt2/grobid) (for metadata extraction)
 - OpenAI API Key (for embeddings & vision)
 - Groq API Key (for fast text generation)
@@ -114,9 +138,17 @@ source venv/bin/activate  # Linux/Mac
 pip install -r requirements.txt
 ```
 
-### 2. Start GROBID Server
+### 2. Start Required Services
 
 ```bash
+# Start PostgreSQL (if not already running)
+docker run -d --name postgres \
+  -e POSTGRES_PASSWORD=postgres \
+  -e POSTGRES_DB=rag_scientific \
+  -p 5432:5432 \
+  postgres:14
+
+# Start GROBID Server
 docker run -t --rm --init \
   -p 8070:8070 \
   -p 8071:8071 \
@@ -135,6 +167,9 @@ cp .env.example .env
 **Required Environment Variables:**
 
 ```env
+# Database Connection (Required)
+RAG_DATABASE_URL=postgresql://postgres:postgres@localhost:5432/rag_scientific
+
 # API Keys (Required)
 OPENAI_API_KEY=sk-xxxxxxxxxxxxxxxxxxxxxxxx
 GROQ_API_KEY=gsk_xxxxxxxxxxxxxxxxxxxxxxxx
@@ -149,14 +184,23 @@ MAX_PARALLEL_TEXT_SUMMARIES=10
 MAX_PARALLEL_IMAGE_SUMMARIES=5
 API_RATE_LIMIT_DELAY=0.1
 
-# Cloud Storage (Optional - for S3/MinIO)
+# Cloud Storage (Required for production)
 S3_ENDPOINT_URL=https://s3.amazonaws.com
 S3_BUCKET=your-bucket-name
 AWS_ACCESS_KEY_ID=your-access-key
 AWS_SECRET_ACCESS_KEY=your-secret-key
 ```
 
-### 4. Start Server
+### 4. Initialize Database
+
+The database tables will be created automatically on first startup. If migrating from a previous version, run:
+
+```bash
+# Migrate existing JSON data to PostgreSQL
+python migrate_to_database.py
+```
+
+### 5. Start Server
 
 ```bash
 # Development

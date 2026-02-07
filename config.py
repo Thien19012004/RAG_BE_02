@@ -1,5 +1,6 @@
 import os
 import hashlib
+import tempfile
 from pathlib import Path
 from typing import Optional
 from dotenv import load_dotenv
@@ -7,16 +8,24 @@ from dotenv import load_dotenv
 # Load environment variables
 load_dotenv()
 
-# Base directories
+# =============================================================================
+# BASE DIRECTORIES
+# =============================================================================
+# Only chroma_store is kept for vector index persistence
+# cache/ and content/ folders are NO LONGER USED - replaced by:
+# - database.py for metadata and status
+# - temp files for PDF processing (cleaned up after ingestion)
+# =============================================================================
+
 BASE_DIR = Path(__file__).parent
-CONTENT_DIR = BASE_DIR / "content"
-CACHE_DIR = BASE_DIR / "cache"
 CHROMA_DIR = BASE_DIR / "chroma_store"
 
+# Temp directory for processing PDFs (cleaned up after ingestion)
+TEMP_DIR = Path(tempfile.gettempdir()) / "rag_processing"
+
 # Ensure directories exist
-CONTENT_DIR.mkdir(exist_ok=True)
-CACHE_DIR.mkdir(exist_ok=True)
 CHROMA_DIR.mkdir(exist_ok=True)
+TEMP_DIR.mkdir(exist_ok=True)
 
 class Settings:
     """Central settings for the RAG pipeline"""
@@ -44,13 +53,20 @@ settings = Settings()
 
 class FileConfig:
     """
-    Configuration for a specific file.
+    Configuration for a specific file being processed.
 
-    Supports two modes:
-    1. Local mode (original): PDF stored locally in CONTENT_DIR
-    2. Cloud mode: PDF downloaded from cloud URL to local temp path for processing
+    CLOUD-FIRST ARCHITECTURE:
+    - PDFs are stored in cloud storage (S3/MinIO)
+    - Local files are temporary, used only during processing
+    - All metadata is stored in PostgreSQL database
+    - Vector embeddings are stored in ChromaDB
 
-    The pdf_path always points to a local file that extraction tools can read.
+    Processing Flow:
+    1. Download PDF from cloud URL to temp directory
+    2. Run GROBID + extraction + summarization
+    3. Store embeddings in ChromaDB
+    4. Store metadata in PostgreSQL
+    5. Clean up temp file
     """
 
     def __init__(self, file_id: str, cloud_url: Optional[str] = None):
@@ -58,25 +74,32 @@ class FileConfig:
         Initialize file configuration.
 
         Args:
-            file_id: Unique identifier for this file (used as folder names)
-            cloud_url: Optional S3/cloud URL. If provided, PDF will be downloaded
-                       from cloud storage before processing.
+            file_id: Unique identifier for this file (UUID, shared with backend)
+            cloud_url: S3/cloud URL where PDF is stored
         """
         self.file_id = file_id
         self.cloud_url = cloud_url
 
-        # Local paths (always used for processing)
-        self._local_pdf_path = CONTENT_DIR / f"{file_id}.pdf"
-        self.cache_dir = CACHE_DIR / file_id
-        self.chroma_path = CHROMA_DIR / file_id
-        self.hash_file = self.chroma_path / "last_hash.txt"
+        # Temp paths for processing (cleaned up after ingestion)
+        self._temp_pdf_path = TEMP_DIR / f"{file_id}.pdf"
 
-        # Ensure directories exist
-        self.cache_dir.mkdir(exist_ok=True)
+        # ChromaDB path (persistent - stores vector embeddings)
+        self.chroma_path = CHROMA_DIR / file_id
+
+        # Ensure chroma directory exists
         self.chroma_path.mkdir(exist_ok=True)
 
-        # Track if we need to download from cloud
+        # Track download status
         self._downloaded = False
+
+    def get_temp_pdf_path(self) -> Path:
+        """
+        Get the temp path for storing the PDF during processing.
+
+        Used by /upload endpoint to save the uploaded file.
+        """
+        TEMP_DIR.mkdir(exist_ok=True)
+        return self._temp_pdf_path
 
     @property
     def pdf_path(self) -> Path:
@@ -86,19 +109,20 @@ class FileConfig:
         If cloud_url is set and file doesn't exist locally, download it first.
         This ensures pdf_extract.py and other tools always have a local file.
         """
-        if self.cloud_url and not self._local_pdf_path.exists() and not self._downloaded:
+        if self.cloud_url and not self._temp_pdf_path.exists() and not self._downloaded:
             self._download_from_cloud()
-        return self._local_pdf_path
+        return self._temp_pdf_path
 
     def _download_from_cloud(self) -> None:
-        """Download PDF from cloud storage to local path."""
+        """Download PDF from cloud storage to temp path."""
         from storage import get_storage_backend
 
         storage = get_storage_backend()
         print(f"☁️ [CONFIG] Downloading PDF from cloud: {self.cloud_url}")
-        storage.download_file(self.cloud_url, self._local_pdf_path)
+        TEMP_DIR.mkdir(exist_ok=True)
+        storage.download_file(self.cloud_url, self._temp_pdf_path)
         self._downloaded = True
-        print(f"✅ [CONFIG] Downloaded to: {self._local_pdf_path}")
+        print(f"✅ [CONFIG] Downloaded to temp: {self._temp_pdf_path}")
 
     def ensure_local_file(self) -> Path:
         """
@@ -106,13 +130,12 @@ class FileConfig:
         Call this before any processing that requires the file.
 
         Returns:
-            Path to local PDF file
+            Path to local PDF file (in temp directory)
         """
         return self.pdf_path
 
     def get_file_hash(self) -> str:
         """Get MD5 hash of the PDF file."""
-        # Ensure file is downloaded first
         pdf_path = self.pdf_path
         with open(pdf_path, "rb") as f:
             return hashlib.md5(f.read()).hexdigest()
@@ -121,30 +144,39 @@ class FileConfig:
         """
         Check if vector store needs to be rebuilt.
 
+        Now uses database instead of local hash file.
+
         Returns:
             Tuple of (needs_rebuild: bool, pdf_hash: str)
         """
+        from database import get_database
+
         pdf_hash = self.get_file_hash()
-        need_rebuild = True
-        if self.hash_file.exists():
-            with open(self.hash_file) as f:
-                if f.read().strip() == pdf_hash:
-                    need_rebuild = False
-        return need_rebuild, pdf_hash
+        db = get_database()
+
+        return db.needs_rebuild(self.file_id, pdf_hash), pdf_hash
 
     def save_hash(self, pdf_hash: str) -> None:
-        """Save the PDF hash to detect changes."""
-        with open(self.hash_file, "w") as f:
-            f.write(pdf_hash)
+        """
+        Save the PDF hash to detect changes.
+
+        Now uses database instead of local hash file.
+        """
+        from database import get_database
+
+        db = get_database()
+        db.save_file_hash(self.file_id, pdf_hash)
 
     def cleanup_local_file(self) -> None:
         """
-        Remove the local PDF file after processing (optional).
-        Useful for cloud mode to save disk space.
+        Remove the local PDF file after processing.
+
+        This is called automatically after successful ingestion
+        to ensure no local file storage is used.
         """
-        if self.cloud_url and self._local_pdf_path.exists():
+        if self._temp_pdf_path.exists():
             try:
-                self._local_pdf_path.unlink()
-                print(f"🗑️ [CONFIG] Cleaned up local file: {self._local_pdf_path}")
+                self._temp_pdf_path.unlink()
+                print(f"🗑️ [CONFIG] Cleaned up temp file: {self._temp_pdf_path}")
             except Exception as e:
                 print(f"⚠️ [CONFIG] Failed to cleanup: {e}")

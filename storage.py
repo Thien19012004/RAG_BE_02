@@ -203,12 +203,13 @@ def get_storage_backend() -> StorageBackend:
     Factory function to get the appropriate storage backend.
 
     Uses S3 if AWS_S3_BUCKET or S3_BUCKET is set, otherwise uses local storage.
+    NOTE: Local storage uses TEMP_DIR now (cloud-first architecture)
     """
-    from config import CONTENT_DIR
+    from config import TEMP_DIR
 
     if os.getenv("AWS_S3_BUCKET") or os.getenv("S3_BUCKET"):
         print("🌩️ [STORAGE] Using S3 storage backend")
         return S3StorageBackend()
     else:
-        print("📁 [STORAGE] Using local storage backend")
-        return LocalStorageBackend(CONTENT_DIR)
+        print("📁 [STORAGE] Using local storage backend (temp directory)")
+        return LocalStorageBackend(TEMP_DIR)

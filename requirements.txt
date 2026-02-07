@@ -21,3 +21,4 @@ camelot-py[cv]
 opencv-python-headless
 arxiv
 boto3  # For S3/MinIO cloud storage
+psycopg2-binary  # PostgreSQL database driver
