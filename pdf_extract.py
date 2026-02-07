@@ -285,6 +285,60 @@ def run_grobid(pdf_path: str, paper_id: str) -> GrobidText:
     return _fallback_parse(pdf_path, paper_id)
 
 
+def _extract_title_from_first_page(doc) -> Optional[str]:
+    """
+    Extract title from first page using heuristics:
+    - Find text blocks with largest font size in top 1/3 of page
+    - Title is usually the largest text near the top
+    """
+    try:
+        first_page = doc[0]
+        blocks = first_page.get_text("dict")["blocks"]
+
+        candidates = []
+        page_height = first_page.rect.height
+
+        for block in blocks:
+            if block.get("type") != 0:  # Skip non-text blocks
+                continue
+
+            for line in block.get("lines", []):
+                for span in line.get("spans", []):
+                    text = span.get("text", "").strip()
+                    font_size = span.get("size", 0)
+                    bbox = span.get("bbox", [0, 0, 0, 0])
+                    y_pos = bbox[1]
+
+                    # Only consider text in top 1/3 of page with reasonable length
+                    if y_pos < page_height / 3 and 10 < len(text) < 300:
+                        candidates.append({
+                            "text": text,
+                            "font_size": font_size,
+                            "y_pos": y_pos
+                        })
+
+        if not candidates:
+            return None
+
+        # Sort by font size (descending), then by y position (ascending)
+        candidates.sort(key=lambda x: (-x["font_size"], x["y_pos"]))
+
+        # Get the largest font text as title
+        title_text = candidates[0]["text"]
+
+        # Clean up: remove extra whitespace
+        title_text = " ".join(title_text.split())
+
+        # Validate: title should be reasonable
+        if len(title_text) < 5 or title_text.isdigit():
+            return None
+
+        return title_text
+
+    except Exception:
+        return None
+
+
 def _fallback_parse(pdf_path: str, paper_id: str) -> GrobidText:
     """Very lightweight PDF -> section text parser used when GROBID is unavailable."""
     try:
@@ -305,9 +359,13 @@ def _fallback_parse(pdf_path: str, paper_id: str) -> GrobidText:
                     page_end=idx + 1,
                 )
             )
+
+        # Try to extract title from first page using font heuristics
+        extracted_title = _extract_title_from_first_page(doc)
+
         return GrobidText(
             paper_id=paper_id,
-            title=Path(pdf_path).stem,
+            title=extracted_title,  # None if extraction failed, let backend handle display
             authors=[],
             abstract=sections[0].text[:500] if sections else "",
             sections=sections,
@@ -316,7 +374,7 @@ def _fallback_parse(pdf_path: str, paper_id: str) -> GrobidText:
         print(f"⚠️ PyMuPDF fallback failed ({exc}); using empty sections.")
         return GrobidText(
             paper_id=paper_id,
-            title=Path(pdf_path).stem,
+            title=None,  # None instead of filename to avoid showing ragFileId
             authors=[],
             abstract="",
             sections=[],
