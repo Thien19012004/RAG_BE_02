@@ -417,36 +417,112 @@ def build_document_rag_chain(
     return final_chain
 
 
-def brainstorm_questions_chain(title: str, abstract: str) -> List[str]:
+def brainstorm_questions_chain(
+    title: str,
+    abstract: str,
+    text_input: Optional[str] = None,
+    relevant_context: Optional[str] = None,
+) -> List[str]:
     """
-    Sử dụng LLM để tạo ra các câu hỏi gợi ý dựa trên Title và Abstract.
+    Sử dụng LLM để tạo ra các câu hỏi gợi ý dựa trên Title, Abstract,
+    và tùy chọn text_input từ user + relevant context từ vector store.
+
+    Nếu text_input được cung cấp, câu hỏi sẽ được sinh ra phù hợp với
+    ý định của user và nội dung bài báo.
     """
-    llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.7) # Tăng temp để sáng tạo hơn
+    llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.7)
 
-    prompt = (
-        f"You are a research expert. Based on the following research paper metadata, "
-        f"suggest 5-8 thought-provoking and diverse questions that a reader should ask "
-        f"to understand the paper's contributions, methodology, and results more deeply.\n\n"
-        f"Title: {title}\n"
-        f"Abstract: {abstract}\n\n"
-        f"Output requirements:\n"
-        f"- Return ONLY a JSON list of strings.\n"
-        f"- Format: [\"question 1\", \"question 2\", ...]\n"
-        f"- Questions should be concise and professional."
-    )
+    # Build dynamic prompt based on whether text_input is provided
+    if text_input and text_input.strip():
+        prompt = (
+            f"You are a research expert analyzing a scientific paper.\n\n"
+            f"Paper Title: {title}\n"
+            f"Paper Abstract: {abstract}\n\n"
+        )
 
-    # Sử dụng .with_structured_output nếu muốn chắc chắn về định dạng (hoặc parse tay)
+        if relevant_context:
+            prompt += (
+                f"Relevant content from the paper related to the user's interest:\n"
+                f"---\n{relevant_context}\n---\n\n"
+            )
+
+        prompt += (
+            f"The user is interested in the following topic/direction:\n"
+            f"\"{text_input}\"\n\n"
+            f"Based on the paper's content AND the user's interest, generate 3-5 "
+            f"highly targeted research questions that:\n"
+            f"1. Are directly relevant to both the paper's content and the user's interest\n"
+            f"2. Help the user explore the specific aspect they care about\n"
+            f"3. Connect the user's interest with the paper's methodology, results, or findings\n"
+            f"4. Range from specific factual questions to deeper analytical ones\n"
+            f"5. Are answerable from the paper's content\n\n"
+            f"Output requirements:\n"
+            f"- Return ONLY a JSON list of strings.\n"
+            f"- Format: [\"question 1\", \"question 2\", ...]\n"
+            f"- Questions should be concise, professional, and in the same language as the user's input when possible."
+        )
+    else:
+        prompt = (
+            f"You are a research expert. Based on the following research paper metadata, "
+            f"suggest 3-5 thought-provoking and diverse questions that a reader should ask "
+            f"to understand the paper's contributions, methodology, and results more deeply.\n\n"
+            f"Title: {title}\n"
+            f"Abstract: {abstract}\n\n"
+            f"Output requirements:\n"
+            f"- Return ONLY a JSON list of strings.\n"
+            f"- Format: [\"question 1\", \"question 2\", ...]\n"
+            f"- Questions should be concise and professional."
+        )
+
     response = llm.invoke(prompt)
 
     try:
-        # Cố gắng parse JSON từ response
         import json
         content = response.content.strip()
-        # Loại bỏ markdown code blocks nếu có
         if content.startswith("```json"):
             content = content.replace("```json", "").replace("```", "").strip()
         return json.loads(content)
     except Exception as e:
         print(f"Error parsing brainstormed questions: {e}")
-        # Fallback: trả về list rỗng hoặc các dòng text
         return [line.strip("- ") for line in response.content.split("\n") if len(line) > 10][:6]
+
+
+def summarize_paper_chain(
+    title: str,
+    abstract: str,
+    context: str,
+) -> str:
+    """
+    Generate a comprehensive, structured summary of a research paper
+    using its title, abstract, and retrieved content sections.
+    """
+    llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.3)
+
+    prompt = (
+        f"You are an expert scientific paper summarizer. Generate a comprehensive, "
+        f"well-structured summary of the following research paper.\n\n"
+        f"Paper Title: {title}\n"
+        f"Paper Abstract: {abstract}\n\n"
+        f"Key Content from the Paper:\n"
+        f"---\n{context}\n---\n\n"
+        f"Write a detailed summary covering these aspects (use markdown formatting):\n"
+        f"## Overview\n"
+        f"A 2-3 sentence high-level overview of what this paper is about.\n\n"
+        f"## Key Contributions\n"
+        f"Bullet points of the main contributions and novel aspects.\n\n"
+        f"## Methodology\n"
+        f"Brief description of the approach/methods used.\n\n"
+        f"## Main Results\n"
+        f"Key findings, performance metrics, or experimental results.\n\n"
+        f"## Significance & Implications\n"
+        f"Why this work matters and potential impact.\n\n"
+        f"Requirements:\n"
+        f"- Be accurate and grounded in the provided content\n"
+        f"- Use clear, academic language\n"
+        f"- Keep the total summary between 300-600 words\n"
+        f"- Use LaTeX for any mathematical expressions: $formula$\n"
+        f"- Do not invent information not present in the content"
+    )
+
+    response = llm.invoke(prompt)
+    return response.content.strip()

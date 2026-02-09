@@ -26,6 +26,7 @@ from rag_pipeline import (
     REGION_EXPLAIN_INSTRUCTIONS,
     split_docs,
     multi_document_retrieve,
+    document_retrieve,
 )
 from api_utils import (
     retrieve_context_for_explain,
@@ -132,9 +133,19 @@ class RelatedPapersResponse(BaseModel):
 
 class BrainstormRequest(BaseModel):
     file_id: str
+    text_input: Optional[str] = None  # User's text hint for question generation
 
 class BrainstormResponse(BaseModel):
     questions: List[str]
+
+
+class SummaryRequest(BaseModel):
+    file_id: str
+
+
+class SummaryResponse(BaseModel):
+    file_id: str
+    summary: str
 
 
 class MultiQueryRequest(BaseModel):
@@ -503,6 +514,8 @@ async def related_papers(req: RelatedPapersRequest):
 async def brainstorm_questions(req: BrainstormRequest):
     """
     Gợi ý các câu hỏi thông minh dựa trên nội dung Abstract của bài báo.
+    Nếu user cung cấp text_input, câu hỏi sẽ được sinh ra phù hợp với
+    ý định của user và nội dung bài báo.
     """
     # 1. Kiểm tra file đã sẵn sàng chưa
     validate_file_ready(req.file_id)
@@ -512,14 +525,90 @@ async def brainstorm_questions(req: BrainstormRequest):
     if not meta:
         raise HTTPException(status_code=404, detail="Metadata not found for brainstorming")
 
-    # 3. Gọi LLM sinh câu hỏi
-    # Lưu ý: Bạn có thể cache kết quả này vào METADATA_REGISTRY nếu không muốn gọi LLM nhiều lần cho cùng 1 file
+    # 3. Retrieve relevant context if text_input provided
+    relevant_context = None
+    if req.text_input and req.text_input.strip():
+        try:
+            docs = document_retrieve(
+                query=req.text_input,
+                paper_id=req.file_id,
+                backend=VECTOR_BACKEND,
+                k=5,
+            )
+            context_parts = split_docs(docs)
+            context_texts = []
+            for item in context_parts.get("texts", []) + context_parts.get("tables", []):
+                context_texts.append(item.get("text", ""))
+            relevant_context = "\n\n".join(context_texts[:5])
+        except Exception as e:
+            print(f"Warning: Failed to retrieve context for brainstorm: {e}")
+
+    # 4. Gọi LLM sinh câu hỏi
     questions = brainstorm_questions_chain(
         title=meta.title or "Unknown Title",
-        abstract=meta.abstract or "No abstract available."
+        abstract=meta.abstract or "No abstract available.",
+        text_input=req.text_input,
+        relevant_context=relevant_context,
     )
 
     return BrainstormResponse(questions=questions)
+
+
+@app.post("/summarize-paper", response_model=SummaryResponse)
+async def summarize_paper(req: SummaryRequest):
+    """
+    Generate a comprehensive summary of the paper using its full content.
+    Retrieves key sections (abstract, introduction, conclusion, methodology)
+    and uses LLM to produce a structured summary.
+    """
+    validate_file_ready(req.file_id)
+
+    meta = load_metadata(req.file_id)
+    if not meta:
+        raise HTTPException(status_code=404, detail="Metadata not found for summarization")
+
+    # Retrieve broad context from the paper for summarization
+    summary_queries = [
+        "abstract introduction background",
+        "methodology approach method proposed",
+        "results experiments evaluation performance",
+        "conclusion future work contributions",
+    ]
+
+    all_context_texts = []
+    seen_content = set()
+
+    for query in summary_queries:
+        try:
+            docs = document_retrieve(
+                query=query,
+                paper_id=req.file_id,
+                backend=VECTOR_BACKEND,
+                k=6,
+            )
+            context_parts = split_docs(docs)
+            for item in context_parts.get("texts", []) + context_parts.get("tables", []):
+                text = item.get("text", "").strip()
+                content_key = text[:150]
+                if content_key not in seen_content and len(text) > 30:
+                    seen_content.add(content_key)
+                    section = item.get("metadata", {}).get("section_title", "")
+                    all_context_texts.append(f"[{section}] {text}" if section else text)
+        except Exception as e:
+            print(f"Warning: Failed to retrieve context for query '{query}': {e}")
+
+    if not all_context_texts:
+        raise HTTPException(status_code=500, detail="Could not retrieve enough content for summarization")
+
+    # Build summary using LLM
+    from rag_pipeline import summarize_paper_chain
+    summary = summarize_paper_chain(
+        title=meta.title or "Unknown Title",
+        abstract=meta.abstract or "",
+        context="\n\n".join(all_context_texts[:20]),  # Limit context size
+    )
+
+    return SummaryResponse(file_id=req.file_id, summary=summary)
 
 
 @app.get("/status/{file_id}")
