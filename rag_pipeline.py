@@ -212,6 +212,10 @@ def build_generative_chain():
     return chain
 
 
+# Similarity threshold: documents below this are considered irrelevant
+RELEVANCE_THRESHOLD = 0.45  # For converted similarity (1/(1+distance))
+
+
 def document_retrieve(
     query: str,
     paper_id: str,
@@ -220,51 +224,60 @@ def document_retrieve(
     k: int = 12,
 ) -> List[Document]:
     """
-    Chiến lược retrieval tối ưu:
+    Chiến lược retrieval tối ưu với similarity threshold:
     1. Nếu là summary: Lấy 1-2 bản ghi Abstract + (k-2) bản ghi Content liên quan nhất.
     2. Nếu là query thường: Lấy k bản ghi tốt nhất từ toàn bộ Store (bao gồm cả Abstract).
+    3. Lọc các kết quả có similarity score thấp hơn RELEVANCE_THRESHOLD.
     """
     query_lower = query.lower()
-    # Mở rộng bộ từ khóa nhận diện ý định tổng quan
     is_summary = any(x in query_lower for x in ["summary", "overview", "main idea", "summarize", "abstract", "conclusion"])
 
-    results: List[Document] = []
+    results_with_scores: List[tuple] = []
 
     if is_summary:
-        # PATH A: Lấy Abstract để nắm ý chính (Bắt buộc)
-        abstract_docs = backend.similarity_search(
+        # PATH A: Lấy Abstract để nắm ý chính
+        abstract_docs = backend.similarity_search_with_score(
             query=query,
             k=1,
             collection=content_collection,
             where={"$and": [{"paper_id": paper_id}, {"modality": "abstract"}]}
         )
-        results.extend(abstract_docs)
+        results_with_scores.extend(abstract_docs)
 
-        # PATH B: Lấy thêm Content để có chi tiết (Không loại trừ phần nào)
-        # k giảm xuống một chút để nhường chỗ cho Abstract
-        search_k = max(8, k - len(results))
-        content_docs = backend.similarity_search(
+        # PATH B: Lấy thêm Content để có chi tiết
+        search_k = max(8, k - len(results_with_scores))
+        content_docs = backend.similarity_search_with_score(
             query=query,
             k=search_k,
             collection=content_collection,
-            where={"paper_id": paper_id} # Tìm toàn bộ để không sót
+            where={"paper_id": paper_id}
         )
-        results.extend(content_docs)
+        results_with_scores.extend(content_docs)
     else:
-        # Truy vấn bình thường: Cho phép tự do tìm kiếm dựa trên độ tương đồng
-        # Abstract vẫn có thể xuất hiện nếu nó thực sự liên quan đến câu hỏi
-        results = backend.similarity_search(
+        # Truy vấn bình thường: Tìm kiếm dựa trên độ tương đồng với scores
+        results_with_scores = backend.similarity_search_with_score(
             query=query,
             k=k,
             collection=content_collection,
             where={"paper_id": paper_id}
         )
 
-    # Khử trùng lặp dựa trên nội dung (Tránh việc Abstract bị lấy 2 lần)
+    # Filter by relevance threshold
+    filtered = [
+        (doc, score) for doc, score in results_with_scores
+        if score >= RELEVANCE_THRESHOLD
+    ]
+
+    # Tag each document with its relevance score for downstream grounding check
+    for doc, score in filtered:
+        if doc.metadata is None:
+            doc.metadata = {}
+        doc.metadata["relevance_score"] = score
+
+    # Khử trùng lặp dựa trên nội dung
     seen_content = set()
     unique_docs = []
-    for doc in results:
-        # Dùng hash hoặc 100 ký tự đầu làm key
+    for doc, score in filtered:
         content_key = doc.page_content[:150].strip()
         if content_key not in seen_content:
             unique_docs.append(doc)
@@ -280,16 +293,17 @@ def multi_document_retrieve(
     content_collection: str = CONTENT_COLLECTION,
     k_per_paper: int = 6,
     total_k: int = 15,
-    relevance_threshold: float = 0.3,
+    relevance_threshold: float = 0.5,
 ) -> List[Document]:
     """
-    Retrieve documents from multiple papers with relevance-based filtering.
+    Retrieve documents from multiple papers with strict per-paper scoring.
 
     Strategy:
-    1. First do a global search across ALL papers to get relevance scores
-    2. Identify which papers have relevant content
-    3. Then do per-paper search only for relevant papers
-    4. Filter out low-relevance citations from unrelated papers
+    1. Retrieve from each paper independently with scores
+    2. Apply absolute threshold to filter irrelevant chunks
+    3. Compute per-paper aggregated relevance to identify primary paper(s)
+    4. Re-rank: strongly penalize docs from weakly-matching papers
+    5. Return only grounded, relevant results
 
     Args:
         query: The user's question
@@ -297,16 +311,16 @@ def multi_document_retrieve(
         backend: Vector store backend
         k_per_paper: How many docs to retrieve per paper initially
         total_k: Final number of docs to return after merging
-        relevance_threshold: Minimum similarity score to include a paper's docs
+        relevance_threshold: Ratio threshold for including a paper's docs
     """
     all_docs_with_scores: List[tuple[Document, float]] = []
 
     # Step 1: Search each paper and track relevance scores
+    paper_scores: Dict[str, List[float]] = {}
     paper_max_scores: Dict[str, float] = {}
 
     for paper_id in paper_ids:
         try:
-            # Use similarity_search_with_score to get relevance scores
             docs_with_scores = backend.similarity_search_with_score(
                 query=query,
                 k=k_per_paper,
@@ -315,11 +329,10 @@ def multi_document_retrieve(
             )
 
             if docs_with_scores:
-                # Track max score for this paper
-                max_score = max(score for _, score in docs_with_scores)
-                paper_max_scores[paper_id] = max_score
+                scores = [score for _, score in docs_with_scores]
+                paper_scores[paper_id] = scores
+                paper_max_scores[paper_id] = max(scores)
 
-                # Tag each doc with its paper_id and score for tracking
                 for doc, score in docs_with_scores:
                     if doc.metadata is None:
                         doc.metadata = {}
@@ -334,31 +347,47 @@ def multi_document_retrieve(
     if not all_docs_with_scores:
         return []
 
-    # Step 2: Determine relevance threshold dynamically
-    # Use the best score across all papers as reference
-    all_scores = [score for _, score in all_docs_with_scores]
-    max_overall_score = max(all_scores) if all_scores else 0
+    # Step 2: Apply ABSOLUTE threshold first - remove clearly irrelevant chunks
+    all_docs_with_scores = [
+        (doc, score) for doc, score in all_docs_with_scores
+        if score >= RELEVANCE_THRESHOLD
+    ]
 
-    # Papers with max score < 50% of best paper's max score are considered less relevant
-    dynamic_threshold = max_overall_score * relevance_threshold
+    if not all_docs_with_scores:
+        return []
 
-    # Step 3: Filter and sort documents
-    # Include all docs from relevant papers, filter out low-score docs from less relevant papers
+    # Step 3: Per-paper scoring — identify primary vs secondary papers
+    # Compute mean of top-3 scores per paper as aggregate relevance
+    paper_agg_scores: Dict[str, float] = {}
+    for paper_id, scores in paper_scores.items():
+        top_scores = sorted(scores, reverse=True)[:3]
+        paper_agg_scores[paper_id] = sum(top_scores) / len(top_scores) if top_scores else 0
+
+    best_paper_score = max(paper_agg_scores.values()) if paper_agg_scores else 0
+
+    # Step 4: Dynamic per-paper threshold — papers with aggregate score
+    # below (best_paper * relevance_threshold) are heavily penalized
+    dynamic_paper_threshold = best_paper_score * relevance_threshold
+
     filtered_docs: List[tuple[Document, float]] = []
-
     for doc, score in all_docs_with_scores:
         paper_id = doc.metadata.get("source_paper_id")
-        paper_max = paper_max_scores.get(paper_id, 0)
+        paper_agg = paper_agg_scores.get(paper_id, 0)
 
-        # If paper's best score is above threshold, include its docs
-        # OR if this specific doc has high relevance, include it
-        if paper_max >= dynamic_threshold or score >= dynamic_threshold:
+        if paper_agg >= dynamic_paper_threshold:
+            # Paper is relevant — include at original score
             filtered_docs.append((doc, score))
+        else:
+            # Paper is weakly relevant — only include if this specific chunk
+            # has very high individual score (above 90% of best paper's max)
+            if score >= best_paper_score * 0.9:
+                filtered_docs.append((doc, score))
+            # Otherwise skip entirely — prevents citations from irrelevant papers
 
-    # Sort by score (higher is better for similarity)
+    # Sort by score (higher is better)
     filtered_docs.sort(key=lambda x: x[1], reverse=True)
 
-    # Step 4: Deduplicate by content
+    # Step 5: Deduplicate by content
     seen_content = set()
     unique_docs: List[Document] = []
 
@@ -371,6 +400,45 @@ def multi_document_retrieve(
     return unique_docs[:total_k]
 
 
+# --- Grounding check ---
+
+UNGROUNDED_INSTRUCTIONS = (
+    "You are a helpful AI assistant. The user asked a question that is NOT covered by "
+    "the provided research paper(s). No relevant context was found in the document(s).\n\n"
+    "Answer the question using your general knowledge.\n"
+    "Do NOT invent citations. Do NOT use [S1], [S2] or any source markers.\n"
+    "Make it clear that this answer is from general knowledge, not from the paper.\n"
+    "Start your response with: \"**Note:** This answer is based on general knowledge, "
+    "not on the content of the provided document(s).\"\n\n"
+    "CRITICAL LaTeX Formatting Rules (MUST follow exactly):\n"
+    "- For inline math, use single dollar signs: $E = mc^2$\n"
+    "- For block/display math, use double dollar signs on their own lines:\n"
+    "$$\n"
+    "\\frac{a}{b} = c\n"
+    "$$\n"
+    "- Always use backslash for LaTeX commands: \\frac, \\sum, \\int, \\sqrt, \\alpha, \\beta\n"
+    "- ALWAYS close every math delimiter: if you open $, you must close with $\n"
+    "- DO NOT leave unbalanced $ signs in your response"
+)
+
+
+def check_grounding(docs: List[Document], threshold: float = RELEVANCE_THRESHOLD) -> bool:
+    """
+    Check if any retrieved document is sufficiently relevant to ground an answer.
+    Returns True if the query IS grounded (i.e. we found relevant context).
+    Returns False if the query is NOT grounded (no relevant context).
+    """
+    if not docs:
+        return False
+
+    for doc in docs:
+        score = (doc.metadata or {}).get("relevance_score", 0)
+        if score >= threshold:
+            return True
+
+    return False
+
+
 def build_document_rag_chain(
     paper_id: str,
     backend: VectorStoreBackend,
@@ -378,7 +446,8 @@ def build_document_rag_chain(
 ):
     """
     Builds a standard RAG chain for the /query endpoint.
-    Retrieval is baked in.
+    Includes grounding check — if no relevant docs found, still answers
+    from general knowledge but returns 0 citations.
     """
     prompt_cfg = prompt_cfg or PromptConfig(paper_id=paper_id)
 
@@ -386,35 +455,50 @@ def build_document_rag_chain(
     def _retrieve_step(input_dict):
         q = input_dict["question"]
         docs = document_retrieve(q, paper_id, backend)
-        return split_docs(docs)
+        return docs
 
-    # 2. Generation Step (Reusing the shared generative chain)
+    # 2. Generation Step
     gen_chain = build_generative_chain()
 
-    # 3. Compose
-    rag_chain = (
-        {
-            "context": RunnableLambda(_retrieve_step),
-            "question": lambda x: x["question"],
-            "prompt_cfg": lambda _: prompt_cfg,
-            "focus_image_b64": lambda _: None, # No focus image in standard query
-        }
-        | gen_chain
-        | RunnableLambda(lambda x: {"response": x}) # Wrap for compatibility
-    )
+    # 3. Compose with grounding check
+    def _run_chain(input_dict):
+        question = input_dict["question"]
+        docs = _retrieve_step(input_dict)
 
-    # Inject context into output for API response
-    final_chain = (
-        RunnablePassthrough.assign(context=RunnableLambda(_retrieve_step))
-        .assign(response=lambda x: gen_chain.invoke({
-            "context": x["context"],
-            "question": x["question"],
-            "prompt_cfg": prompt_cfg,
-            "focus_image_b64": None
-        }))
-    )
+        if check_grounding(docs):
+            # Grounded: answer from paper context with citations
+            context = split_docs(docs)
+            response = gen_chain.invoke({
+                "context": context,
+                "question": question,
+                "prompt_cfg": prompt_cfg,
+                "focus_image_b64": None,
+            })
+            return {
+                "response": response,
+                "context": context,
+                "grounded": True,
+            }
+        else:
+            # Ungrounded: answer from general knowledge, 0 citations
+            ungrounded_cfg = PromptConfig(
+                paper_id=paper_id,
+                system_instructions=UNGROUNDED_INSTRUCTIONS,
+            )
+            empty_context = {"texts": [], "tables": [], "images": []}
+            response = gen_chain.invoke({
+                "context": empty_context,
+                "question": question,
+                "prompt_cfg": ungrounded_cfg,
+                "focus_image_b64": None,
+            })
+            return {
+                "response": response,
+                "context": empty_context,
+                "grounded": False,
+            }
 
-    return final_chain
+    return RunnableLambda(_run_chain)
 
 
 def brainstorm_questions_chain(

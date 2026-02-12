@@ -27,6 +27,8 @@ from rag_pipeline import (
     split_docs,
     multi_document_retrieve,
     document_retrieve,
+    check_grounding,
+    UNGROUNDED_INSTRUCTIONS,
 )
 from api_utils import (
     retrieve_context_for_explain,
@@ -364,6 +366,26 @@ async def query_multi_pdf(req: MultiQueryRequest):
         k_per_paper=6,
         total_k=15,
     )
+
+    # Grounding check: if no relevant docs, answer from general knowledge with 0 citations
+    if not check_grounding(docs):
+        ungrounded_cfg = PromptConfig(
+            paper_id=None,
+            system_instructions=UNGROUNDED_INSTRUCTIONS,
+        )
+        empty_context = {"texts": [], "tables": [], "images": []}
+        gen_chain = build_generative_chain()
+        answer = gen_chain.invoke({
+            "context": empty_context,
+            "question": req.question,
+            "prompt_cfg": ungrounded_cfg,
+            "focus_image_b64": None,
+        })
+        return MultiQueryResponse(
+            answer=answer,
+            context=empty_context,
+            sources=[],
+        )
 
     # Split docs into modality groups
     context = split_docs(docs)
