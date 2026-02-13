@@ -62,54 +62,58 @@ RAG Scientific là một service xử lý và phân tích tài liệu PDF khoa h
 │                     Persistence Layer                            │
 │  ┌───────────────┐  ┌───────────────┐  ┌───────────────────────┐│
 │  │  PostgreSQL   │  │  S3/Cloud     │  │      ChromaDB         ││
-│  │  (metadata,   │  │  Storage      │  │   (vector index)      ││
+│  │  (cache,      │  │  Storage      │  │   (vector index)      ││
 │  │   summaries)  │  │  (PDFs)       │  │                       ││
 │  └───────────────┘  └───────────────┘  └───────────────────────┘│
 │         ▲                  ▲                     ▲              │
 │         │                  │                     │              │
 │         └──────────────────┴─────────────────────┘              │
-│                    NO LOCAL FILE STORAGE                         │
+│                                                                  │
+│           storage.py (S3/Local abstraction)                      │
+│           Temp files cleaned after processing                    │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
 ### Database Tables (RAG Service Owned)
 
-| Table                     | Purpose                                    |
-| ------------------------- | ------------------------------------------ |
-| `ingested_papers`         | Paper status, metadata, file hash tracking |
-| `paper_content_summaries` | Cached LLM summaries for tables/images     |
+| Table                     | Purpose                                 |
+| ------------------------- | --------------------------------------- |
+| `rag_paper_cache`         | File content hash for rebuild detection |
+| `paper_content_summaries` | Cached LLM summaries for tables/images  |
 
 ### Single Source of Truth
 
-| Data              | Owner                      | Table/Field                        |
-| ----------------- | -------------------------- | ---------------------------------- |
-| PDF Cloud URL     | NestJS (rag-scientific-be) | `papers.file_url`                  |
-| Ingestion Status  | RAG_BE_02                  | `ingested_papers.ingestion_status` |
-| Paper Metadata    | RAG_BE_02                  | `ingested_papers.*`                |
-| LLM Summaries     | RAG_BE_02                  | `paper_content_summaries`          |
-| Vector Embeddings | RAG_BE_02                  | ChromaDB (`chroma_store/`)         |
+| Data              | Owner                      | Table/Field                         |
+| ----------------- | -------------------------- | ----------------------------------- |
+| PDF Cloud URL     | NestJS (rag-scientific-be) | `papers.file_url`                   |
+| Paper Metadata    | NestJS (rag-scientific-be) | `papers.*` (title, abstract, etc)   |
+| Processing Status | NestJS (rag-scientific-be) | `papers.status`                     |
+| File Hash         | RAG_BE_02                  | `rag_paper_cache.file_content_hash` |
+| LLM Summaries     | RAG_BE_02                  | `paper_content_summaries`           |
+| Vector Embeddings | RAG_BE_02                  | ChromaDB (`chroma_store/`)          |
 
 ### Data Flow
 
 ```
-PDF (S3) → Download to Temp → GROBID Parse → Extract (Text/Table/Image)
-                                                    │
-                                                    ▼
-                                            Parallel Summarization
-                                                    │
-                                                    ▼
-                        ┌───────────────────────────┴───────────────────────────┐
-                        │                                                       │
-                        ▼                                                       ▼
-                PostgreSQL                                               ChromaDB
-            (metadata + summaries)                                    (embeddings)
-                        │                                                       │
-                        └───────────────────────────┬───────────────────────────┘
-                                                    ▼
-                                        Cleanup Temp File
-                                                    │
-                                                    ▼
-                                            Ready for Query ✓
+PDF (S3/Cloud) → storage.py downloads to temp → GROBID Parse → Extract (Text/Table/Image)
+                                                                      │
+                                                                      ▼
+                                                              Parallel Summarization
+                                                                      │
+                                                                      ▼
+                        ┌─────────────────────────────────────────────┴─────────────────────────┐
+                        │                                                                       │
+                        ▼                                                                       ▼
+                PostgreSQL                                                                 ChromaDB
+          (rag_paper_cache +                                                          (vector embeddings)
+       paper_content_summaries)                                                                 │
+                        │                                                                       │
+                        └───────────────────────────────────┬───────────────────────────────────┘
+                                                            ▼
+                                                    Cleanup temp file
+                                                            │
+                                                            ▼
+                                                    Ready for Query ✓
 ```
 
 ## 🚀 Installation
@@ -224,16 +228,19 @@ http://localhost:8000
 
 ### Endpoints Overview
 
-| Method | Endpoint                | Description                         |
-| ------ | ----------------------- | ----------------------------------- |
-| `POST` | `/upload`               | Upload PDF file trực tiếp           |
-| `POST` | `/ingest-from-url`      | Ingest PDF từ S3/Cloud URL          |
-| `POST` | `/query`                | Hỏi đáp về 1 paper                  |
-| `POST` | `/query-multi`          | Hỏi đáp đa paper (so sánh)          |
-| `POST` | `/explain-region`       | Giải thích vùng được chọn trong PDF |
-| `POST` | `/brainstorm-questions` | Gợi ý câu hỏi hay về paper          |
-| `POST` | `/related-papers`       | Tìm papers liên quan trên arXiv     |
-| `GET`  | `/status/{file_id}`     | Kiểm tra trạng thái xử lý           |
+| Method   | Endpoint                   | Description                          |
+| -------- | -------------------------- | ------------------------------------ |
+| `POST`   | `/upload`                  | Upload PDF file trực tiếp            |
+| `POST`   | `/ingest-from-url`         | Ingest PDF từ S3/Cloud URL           |
+| `POST`   | `/query`                   | Hỏi đáp về 1 paper                   |
+| `POST`   | `/query-multi`             | Hỏi đáp đa paper (so sánh)           |
+| `POST`   | `/explain-region`          | Giải thích vùng được chọn trong PDF  |
+| `POST`   | `/brainstorm-questions`    | Gợi ý câu hỏi hay về paper           |
+| `POST`   | `/summarize-paper`         | Generate comprehensive paper summary |
+| `POST`   | `/related-papers`          | Tìm papers liên quan trên arXiv      |
+| `GET`    | `/status/{file_id}`        | Kiểm tra trạng thái xử lý            |
+| `DELETE` | `/cleanup/{file_id}`       | Cleanup all RAG data for a file      |
+| `GET`    | `/cleanup/orphaned-guests` | Get orphaned guest files list        |
 
 ---
 
@@ -405,6 +412,73 @@ curl "http://localhost:8000/status/8fc4b997-0165-41c4-8e5c-f2effa478855"
 
 ---
 
+### 📝 Summarize Paper
+
+Generate comprehensive summary of the paper:
+
+```bash
+curl -X POST "http://localhost:8000/summarize-paper" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "file_id": "8fc4b997-0165-41c4-8e5c-f2effa478855"
+  }'
+```
+
+**Response:**
+
+```json
+{
+  "file_id": "8fc4b997-0165-41c4-8e5c-f2effa478855",
+  "summary": "This paper introduces the Transformer architecture, which relies entirely on attention mechanisms..."
+}
+```
+
+---
+
+### 🗑️ Cleanup File Data
+
+Delete all RAG data for a file (called by Backend when paper deleted):
+
+```bash
+curl -X DELETE "http://localhost:8000/cleanup/8fc4b997-0165-41c4-8e5c-f2effa478855"
+```
+
+**Response:**
+
+```json
+{
+  "file_id": "8fc4b997-0165-41c4-8e5c-f2effa478855",
+  "cleaned": {
+    "vector_store": true
+  }
+}
+```
+
+---
+
+### 🧹 Get Orphaned Guest Files
+
+Get list of guest files that can be cleaned up (24h TTL):
+
+```bash
+curl "http://localhost:8000/cleanup/orphaned-guests?max_age_hours=24"
+```
+
+**Response:**
+
+```json
+{
+  "count": 5,
+  "max_age_hours": 24,
+  "files": [
+    { "rag_paper_id": "guest-uuid-1" },
+    { "rag_paper_id": "guest-uuid-2" }
+  ]
+}
+```
+
+---
+
 ## ⚙️ Configuration
 
 ### Directory Structure
@@ -413,6 +487,8 @@ curl "http://localhost:8000/status/8fc4b997-0165-41c4-8e5c-f2effa478855"
 RAG_BE_02/
 ├── api.py                 # FastAPI application
 ├── config.py              # Configuration & FileConfig
+├── database.py            # PostgreSQL interface
+├── storage.py             # S3/Local storage abstraction
 ├── rag_pipeline.py        # RAG chain construction
 ├── langchain_multimodal.py # Ingestion pipeline
 ├── pdf_extract.py         # PDF processing (PyMuPDF + Camelot)
@@ -422,19 +498,16 @@ RAG_BE_02/
 ├── parallel_processing.py # Async parallel utilities
 ├── api_utils.py           # API helper functions
 │
-├── content/               # Uploaded PDFs (local mode)
-├── cache/                 # Cached summaries & metadata
-│   ├── metadata_registry.json
-│   ├── status_registry.json
-│   └── {file_id}/
-│       ├── paper_metadata.json
-│       ├── table_summaries.json
-│       └── image_summaries.json
-│
-└── chroma_store/          # Vector embeddings
+└── chroma_store/          # Vector embeddings (persistent)
     ├── global_store/
     └── {file_id}/
 ```
+
+**Note**:
+
+- ✅ Metadata stored in PostgreSQL (database.py)
+- ✅ PDFs stored in S3/Cloud (storage.py)
+- ✅ Temp files auto-cleaned after processing
 
 ### Model Configuration
 
