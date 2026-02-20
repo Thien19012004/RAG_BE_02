@@ -326,6 +326,28 @@ curl -X POST "http://localhost:8000/query-multi" \
 
 ---
 
+### ✍️ Freeform Generation ("Ask AI")
+
+Generate arbitrary text using the AI model without any paper context. The response will mirror the language of the prompt and is used by the notebook "Ask AI" tool.
+
+```bash
+curl -X POST "http://localhost:8000/generate" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "prompt": "Write a short summary of reinforcement learning in Vietnamese."
+  }'
+```
+
+**Response:**
+
+```json
+{
+  "answer": "Học tăng cường (reinforcement learning) là một lĩnh vực của trí tuệ nhân tạo..."
+}
+```
+
+---
+
 ### 🔍 Explain Region
 
 Giải thích một vùng được crop từ PDF (figure, table, equation...):
