@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Database module for RAG_BE_02.
+Database module for rag service (Pipeline_RAG).
 
 This module provides PostgreSQL database access for the RAG service.
 It handles:
@@ -102,7 +102,7 @@ class ContentSummaryRecord:
 
 class RAGDatabase:
     """
-    PostgreSQL database interface for RAG_BE_02.
+    PostgreSQL database interface for rag service (Pipeline_RAG).
 
     RAG service owns:
     - rag_paper_cache: File hash for rebuild detection

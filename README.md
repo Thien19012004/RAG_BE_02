@@ -50,7 +50,7 @@ RAG Scientific là một service xử lý và phân tích tài liệu PDF khoa h
                                 │
                                 ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│                      FastAPI Application (RAG_BE_02)             │
+│                      FastAPI Application (rag service (Pipeline_RAG))             │
 │  ┌─────────────┐ ┌─────────────┐ ┌─────────────┐ ┌────────────┐ │
 │  │   /upload   │ │   /query    │ │/query-multi │ │ /brainstorm│ │
 │  │ /ingest-url │ │/explain-reg.│ │/related-pap.│ │  /status   │ │
@@ -88,9 +88,9 @@ RAG Scientific là một service xử lý và phân tích tài liệu PDF khoa h
 | PDF Cloud URL     | NestJS (rag-scientific-be) | `papers.file_url`                   |
 | Paper Metadata    | NestJS (rag-scientific-be) | `papers.*` (title, abstract, etc)   |
 | Processing Status | NestJS (rag-scientific-be) | `papers.status`                     |
-| File Hash         | RAG_BE_02                  | `rag_paper_cache.file_content_hash` |
-| LLM Summaries     | RAG_BE_02                  | `paper_content_summaries`           |
-| Vector Embeddings | RAG_BE_02                  | ChromaDB (`chroma_store/`)          |
+| File Hash         | rag service (Pipeline_RAG) | `rag_paper_cache.file_content_hash` |
+| LLM Summaries     | rag service (Pipeline_RAG) | `paper_content_summaries`           |
+| Vector Embeddings | rag service (Pipeline_RAG) | ChromaDB (`chroma_store/`)          |
 
 ### Data Flow
 
@@ -130,7 +130,7 @@ PDF (S3/Cloud) → storage.py downloads to temp → GROBID Parse → Extract (Te
 
 ```bash
 # Navigate to project
-cd RAG_BE_02
+cd rag service (Pipeline_RAG)
 
 # Create virtual environment
 python -m venv venv
@@ -506,7 +506,7 @@ curl "http://localhost:8000/cleanup/orphaned-guests?max_age_hours=24"
 ### Directory Structure
 
 ```
-RAG_BE_02/
+rag service (Pipeline_RAG)/
 ├── api.py                 # FastAPI application
 ├── config.py              # Configuration & FileConfig
 ├── database.py            # PostgreSQL interface

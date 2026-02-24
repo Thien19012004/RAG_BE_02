@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Storage abstraction layer for RAG_BE_02.
+Storage abstraction layer for rag service (Pipeline_RAG).
 Supports both local filesystem and cloud storage (S3/MinIO).
 """
 
