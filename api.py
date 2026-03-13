@@ -209,6 +209,7 @@ async def build_pipeline_sync(file_config: FileConfig) -> IngestionResult:
         prompt_cfg = PromptConfig(
             paper_id=file_config.file_id,
             paper_title=res.title,
+            paper_abstract=res.abstract,
         )
         chain = build_document_rag_chain(file_config.file_id, VECTOR_BACKEND, prompt_cfg)
 
@@ -336,6 +337,7 @@ async def query_pdf(req: QueryRequest):
         prompt_cfg = PromptConfig(
             paper_id=req.file_id,
             paper_title=res.title,
+            paper_abstract=res.abstract,
         )
         chain = build_document_rag_chain(req.file_id, VECTOR_BACKEND, prompt_cfg)
         pipelines[req.file_id] = chain

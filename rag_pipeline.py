@@ -17,6 +17,7 @@ from vectorstore_setup import (
 class PromptConfig:
     paper_id: Optional[str] = None
     paper_title: Optional[str] = None
+    paper_abstract: Optional[str] = None
     system_instructions: Optional[str] = None
     # Biến cờ để xác định chế độ giải thích vùng ảnh
     is_visual_explanation: bool = False
@@ -148,9 +149,20 @@ def build_mm_prompt(kwargs: Dict[str, Any]):
     # 3. Construct Message Content
     content = []
 
+    # Inject global context (Title & Abstract)
+    global_context = ""
+    if prompt_cfg.paper_title or prompt_cfg.paper_abstract:
+        global_context += "--- PAPER OVERVIEW (Use this to understand the big picture) ---\n"
+        if prompt_cfg.paper_title:
+            global_context += f"Title: {prompt_cfg.paper_title}\n"
+        if prompt_cfg.paper_abstract:
+            global_context += f"Abstract: {prompt_cfg.paper_abstract}\n"
+        global_context += "\n"
+
     # Text Part
     text_content = (
         f"{'\n'.join(instructions)}\n\n"
+        f"{global_context}"
         f"--- CONTEXT START ---\n{context_str}\n--- CONTEXT END ---\n\n"
         f"User Question: {question}\n"
     )
@@ -216,6 +228,57 @@ def build_generative_chain():
 RELEVANCE_THRESHOLD = 0.45  # For converted similarity (1/(1+distance))
 
 
+def analyze_user_query(query: str) -> dict:
+    import json
+    from langchain_core.prompts import PromptTemplate
+    from langchain_openai import ChatOpenAI
+    from langchain_core.output_parsers import StrOutputParser
+
+    if len(query) > 500:
+        # Avoid running analysis on giant text blocks (e.g. from /brainstorm-questions)
+        print(f"\n[QUERY ROUTER] Query too long ({len(query)} chars). Skipping analysis.")
+        return {"intent": "SPECIFIC", "search_queries": [query[:200]]}
+
+    llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+    prompt = PromptTemplate.from_template(
+        "You are a routing assistant for a scientific RAG system.\n"
+        "Analyze the user's query and output a JSON dictionary with two keys: 'intent' and 'search_queries'.\n"
+        "1. 'intent': 'GLOBAL' if the user asks for high-level summaries, core concepts, or the abstract. 'SPECIFIC' if they ask about details.\n"
+        "2. 'search_queries': Generate 1 to 3 optimized queries to find relevant text INSIDE the user's paper. "
+        "CRITICAL: If the user asks 'Explain the abstract' or 'Summarize', DO NOT generate general queries like 'how to write an abstract'. "
+        "Instead, generate keywords that will match the paper's actual content (e.g., ['abstract', 'introduction', 'conclusion', 'summary']).\n"
+        "Translate any casual terms into academic English.\n\n"
+        "Output strictly in JSON format.\n\n"
+        "User Query: {query}"
+    )
+
+    chain = prompt | llm | StrOutputParser()
+    try:
+        result = chain.invoke({"query": query})
+        content = result.strip()
+        if content.startswith("```json"):
+            content = content.replace("```json", "").replace("```", "").strip()
+        elif content.startswith("```"):
+            content = content.replace("```", "").strip()
+        parsed = json.loads(content)
+        
+        intent = parsed.get("intent", "SPECIFIC")
+        search_queries = parsed.get("search_queries", [query])
+        
+        # LOGGING INTENT AND QUERIES
+        print(f"\n[QUERY ROUTER] Parsed user query: '{query[:100]}...'")
+        print(f"[QUERY ROUTER] Detected Intent: {intent}")
+        print(f"[QUERY ROUTER] Optimized Search Queries: {search_queries}\n")
+        
+        return {
+            "intent": intent,
+            "search_queries": search_queries
+        }
+    except Exception as e:
+        print(f"[QUERY ROUTER] Error parsing user query analysis: {e}")
+        return {"intent": "SPECIFIC", "search_queries": [query]}
+
+
 def document_retrieve(
     query: str,
     paper_id: str,
@@ -224,49 +287,59 @@ def document_retrieve(
     k: int = 12,
 ) -> List[Document]:
     """
-    Chiến lược retrieval tối ưu với similarity threshold:
-    1. Nếu là summary: Lấy 1-2 bản ghi Abstract + (k-2) bản ghi Content liên quan nhất.
-    2. Nếu là query thường: Lấy k bản ghi tốt nhất từ toàn bộ Store (bao gồm cả Abstract).
-    3. Lọc các kết quả có similarity score thấp hơn RELEVANCE_THRESHOLD.
+    Advanced RAG retrieval with Query Routing and Rewriting.
     """
-    query_lower = query.lower()
-    is_summary = any(x in query_lower for x in ["summary", "overview", "main idea", "summarize", "abstract", "conclusion"])
+    analysis = analyze_user_query(query)
+    intent = analysis.get("intent", "SPECIFIC")
+    search_queries = analysis.get("search_queries", [query])
+    
+    # ALWAYS ensure the exact original user query is included first to capture semantic nuances
+    if query not in search_queries:
+        search_queries.insert(0, query)
 
     results_with_scores: List[tuple] = []
 
-    if is_summary:
-        # PATH A: Lấy Abstract để nắm ý chính
-        abstract_docs = backend.similarity_search_with_score(
-            query=query,
-            k=1,
-            collection=content_collection,
-            where={"$and": [{"paper_id": paper_id}, {"modality": "abstract"}]}
-        )
-        results_with_scores.extend(abstract_docs)
+    if intent == "GLOBAL":
+        for search_query in search_queries:
+            abstract_docs = backend.similarity_search_with_score(
+                query=search_query,
+                k=2,
+                collection=content_collection,
+                where={"$and": [{"paper_id": paper_id}, {"modality": "abstract"}]}
+            )
+            # Boost score for abstract chunks because they are intrinsically relevant to a GLOBAL query
+            abstract_docs = [(doc, max(score, RELEVANCE_THRESHOLD + 0.1)) for doc, score in abstract_docs]
+            results_with_scores.extend(abstract_docs)
 
-        # PATH B: Lấy thêm Content để có chi tiết
-        search_k = max(8, k - len(results_with_scores))
+            try:
+                optional_docs = backend.similarity_search_with_score(
+                    query=search_query,
+                    k=2,
+                    collection=content_collection,
+                    where={"$and": [{"paper_id": paper_id}, {"section_title": {"$in": ["Introduction", "Conclusion", "Discussion"]}}]}
+                )
+                results_with_scores.extend(optional_docs)
+            except Exception:
+                pass  # Fallback gracefully if vector store indexing/querying for $in fails
+
+    k_per_query = max(3, k // len(search_queries))
+    for search_query in search_queries:
         content_docs = backend.similarity_search_with_score(
-            query=query,
-            k=search_k,
+            query=search_query,
+            k=k_per_query,
             collection=content_collection,
             where={"paper_id": paper_id}
         )
         results_with_scores.extend(content_docs)
-    else:
-        # Truy vấn bình thường: Tìm kiếm dựa trên độ tương đồng với scores
-        results_with_scores = backend.similarity_search_with_score(
-            query=query,
-            k=k,
-            collection=content_collection,
-            where={"paper_id": paper_id}
-        )
 
     # Filter by relevance threshold
     filtered = [
         (doc, score) for doc, score in results_with_scores
         if score >= RELEVANCE_THRESHOLD
     ]
+
+    # CRITICAL: Sort by score (descending) before deduplication
+    filtered.sort(key=lambda x: x[1], reverse=True)
 
     # Tag each document with its relevance score for downstream grounding check
     for doc, score in filtered:
