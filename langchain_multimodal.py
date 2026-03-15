@@ -105,7 +105,7 @@ def _get_pdf_page_count(pdf_path: str) -> int:
         return 0
 
 
-async def ingest_document(file_config, backend: VectorStoreBackend) -> IngestionResult:
+async def ingest_document(file_config, backend: VectorStoreBackend, collection: str = CONTENT_COLLECTION) -> IngestionResult:
     """Ingest a PDF into the abstract/content stores while keeping caches updated."""
     print(f"🔧 [PIPELINE] Start ingest for paper_id={file_config.file_id}")
     need_rebuild, pdf_hash = file_config.needs_rebuild()
@@ -182,7 +182,7 @@ async def ingest_document(file_config, backend: VectorStoreBackend) -> Ingestion
     # -------------------------------------------------------------------------
     # 4) Ghi vào vector store (content + abstract)
     # -------------------------------------------------------------------------
-    backend.delete_where(CONTENT_COLLECTION, {"paper_id": file_config.file_id})
+    backend.delete_where(collection, {"paper_id": file_config.file_id})
 
     documents: List[Document] = []
 
@@ -261,8 +261,8 @@ async def ingest_document(file_config, backend: VectorStoreBackend) -> Ingestion
         )
         documents.append(Document(page_content=summary, metadata=metadata))
 
-    backend.add_documents(documents, CONTENT_COLLECTION)
-    print(f"📦 [PIPELINE] Added {len(documents)} docs to content collection")
+    backend.add_documents(documents, collection)
+    print(f"📦 [PIPELINE] Added {len(documents)} docs to '{collection}' collection")
 
     # -------------------------------------------------------------------------
     # 5.5) Get page count from PDF

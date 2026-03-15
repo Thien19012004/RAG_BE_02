@@ -1,5 +1,6 @@
 # Python
 __pycache__/
+*.py[cod]
 *.pyc
 *.pyo
 *.pyd
@@ -10,13 +11,20 @@ venv/
 ENV/
 env/
 
-# Chroma vector store
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+
+# Chroma vector store (large, local only)
 chroma_store/
 content/
 cache/
 
-# Environment variables
+# Environment variables - NEVER commit secrets!
 .env
+.env.*
+!.env.example
 
 # OS files
 .DS_Store
@@ -24,7 +32,17 @@ Thumbs.db
 
 # Logs and cache
 *.log
+logs/
 .cache/
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Type checking
+.mypy_cache/
+.pyright/
 
 .cursorignore
 

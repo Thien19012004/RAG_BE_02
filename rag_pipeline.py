@@ -7,6 +7,8 @@ from langchain_core.output_parsers import StrOutputParser
 from langchain_core.runnables import RunnableLambda, RunnablePassthrough
 from langchain_openai import ChatOpenAI
 
+from model_factory import get_llm
+
 from vectorstore_setup import (
     CONTENT_COLLECTION,
     VectorStoreBackend,
@@ -202,7 +204,7 @@ def build_generative_chain():
         "focus_image_b64": Optional[str]
     }
     """
-    final_llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.2)
+    final_llm = get_llm("generation")
 
     chain = (
         RunnableLambda(build_mm_prompt)
@@ -210,6 +212,329 @@ def build_generative_chain():
         | StrOutputParser()
     )
     return chain
+
+
+# --- HyDE Query Transformation (F2) ---
+
+def hyde_transform(question: str) -> str:
+    """
+    HyDE: Hypothetical Document Embeddings.
+    Generate a hypothetical answer paragraph to improve retrieval embedding.
+
+    Short/ambiguous queries embed poorly. This generates a longer, more specific
+    text that embeds closer to relevant chunks.
+
+    Returns the hypothetical answer, or the original question on error.
+    """
+    if not question or not question.strip():
+        return question
+
+    try:
+        llm = get_llm("hyde")
+        prompt = (
+            "You are a scientific expert. Given the following question, write a short "
+            "hypothetical paragraph (100-200 words) that would be a good answer. "
+            "Write as if you found this text in a research paper.\n\n"
+            f"Question: {question}\n\n"
+            "Hypothetical answer paragraph:"
+        )
+        response = llm.invoke(prompt)
+        result = response.content if hasattr(response, 'content') else str(response)
+        return result.strip() if result and result.strip() else question
+    except Exception as e:
+        print(f"[HyDE] Error: {e}, falling back to original query")
+        return question
+
+
+# --- Multi-Paper Query Decomposition ---
+
+def decompose_multi_query(
+    question: str,
+    paper_titles: Dict[str, str],
+) -> Dict[str, Any]:
+    """
+    Analyze a multi-paper question and decompose it into sub-queries.
+
+    For comparative/meta questions (e.g. "Are these papers related?"),
+    the original question embeds poorly against specific document chunks.
+    This function decomposes it into per-paper sub-queries that retrieve
+    relevant chunks from each paper independently.
+
+    Args:
+        question: The user's original question
+        paper_titles: Dict mapping paper_id -> title
+
+    Returns:
+        {
+            "type": "COMPARATIVE" | "SUMMARY" | "DIRECT",
+            "sub_queries": list of specific retrieval queries,
+            "needs_summaries": bool,
+            "original": original question
+        }
+    """
+    if not question or not question.strip() or len(paper_titles) < 2:
+        return {
+            "type": "DIRECT",
+            "sub_queries": [question],
+            "needs_summaries": False,
+            "original": question,
+        }
+
+    paper_list = "\n".join(
+        [f"- [{pid[:8]}] {title}" for pid, title in paper_titles.items()]
+    )
+
+    try:
+        llm = get_llm("condense")
+        prompt = (
+            "You are a research assistant analyzing a question about multiple papers.\n\n"
+            f"Papers:\n{paper_list}\n\n"
+            f"User question: \"{question}\"\n\n"
+            "Classify this question into ONE of these types:\n"
+            "1. COMPARATIVE — comparing, contrasting, or asking about relationships between papers\n"
+            "2. SUMMARY — requesting an overview or summary of multiple papers\n"
+            "3. DIRECT — a specific technical question that can be answered by searching chunks\n\n"
+            "Then generate sub-queries optimized for semantic search.\n"
+            "For COMPARATIVE: generate one specific query per paper that extracts the aspect being compared.\n"
+            "For SUMMARY: generate one query per paper asking for main contributions.\n"
+            "For DIRECT: return the original question as-is.\n\n"
+            "Respond in EXACTLY this format (no extra text):\n"
+            "TYPE: <COMPARATIVE|SUMMARY|DIRECT>\n"
+            "QUERIES:\n"
+            "- <query 1>\n"
+            "- <query 2>\n"
+            "..."
+        )
+
+        response = llm.invoke(prompt)
+        text = response.content if hasattr(response, "content") else str(response)
+        text = text.strip()
+
+        # Parse response
+        query_type = "DIRECT"
+        sub_queries = [question]
+
+        lines = text.split("\n")
+        for line in lines:
+            line = line.strip()
+            if line.upper().startswith("TYPE:"):
+                parsed = line.split(":", 1)[1].strip().upper()
+                if parsed in ("COMPARATIVE", "SUMMARY", "DIRECT"):
+                    query_type = parsed
+
+        # Extract sub-queries
+        in_queries = False
+        parsed_queries: List[str] = []
+        for line in lines:
+            line = line.strip()
+            if line.upper().startswith("QUERIES:"):
+                in_queries = True
+                continue
+            if in_queries and line.startswith("- "):
+                q = line[2:].strip()
+                if q:
+                    parsed_queries.append(q)
+
+        if parsed_queries:
+            sub_queries = parsed_queries
+
+        needs_summaries = query_type in ("COMPARATIVE", "SUMMARY")
+
+        print(
+            f"[DecomposeMultiQuery] type={query_type}, "
+            f"sub_queries={len(sub_queries)}, needs_summaries={needs_summaries}"
+        )
+
+        return {
+            "type": query_type,
+            "sub_queries": sub_queries,
+            "needs_summaries": needs_summaries,
+            "original": question,
+        }
+
+    except Exception as e:
+        print(f"[DecomposeMultiQuery] Error: {e}, falling back to DIRECT")
+        return {
+            "type": "DIRECT",
+            "sub_queries": [question],
+            "needs_summaries": False,
+            "original": question,
+        }
+
+
+# --- Conversation Memory / Question Condensing (F3) ---
+
+def condense_question(
+    chat_history: Optional[List[Dict[str, str]]],
+    question: str,
+    summary: str = "",
+    max_history: int = 10,
+    custom_condense_prompt: str = "",
+) -> str:
+    """
+    Condense a follow-up question using chat history + rolling summary
+    into a standalone question.
+
+    Args:
+        chat_history: Recent messages within the sliding window
+        question: The follow-up question
+        summary: Rolling summary of older messages beyond the window
+        max_history: Max messages to include from history
+        custom_condense_prompt: Optional custom prompt text (from admin config)
+
+    Returns standalone question, or original question if no history or on error.
+    """
+    if not chat_history and not summary:
+        return question
+
+    # Limit history to most recent messages
+    recent = (chat_history or [])[-max_history:]
+
+    try:
+        llm = get_llm("condense")
+        history_str = "\n".join(
+            f"{msg.get('role', 'user').capitalize()}: {msg.get('content', '')}"
+            for msg in recent
+        )
+
+        summary_block = ""
+        if summary:
+            summary_block = (
+                f"Summary of earlier conversation:\n{summary}\n\n"
+            )
+
+        # Use custom prompt if provided, otherwise default
+        condense_instruction = custom_condense_prompt or (
+            "Given the following conversation context and a follow-up question, "
+            "rephrase the follow-up question to be a standalone question that "
+            "can be understood without the conversation history."
+        )
+
+        prompt = (
+            f"{condense_instruction}\n\n"
+            f"{summary_block}"
+            f"Recent Chat History:\n{history_str}\n\n"
+            f"Follow-up Question: {question}\n\n"
+            "Standalone Question:"
+        )
+        response = llm.invoke(prompt)
+        result = response.content if hasattr(response, 'content') else str(response)
+        condensed = result.strip() if result and result.strip() else question
+        print(f"[Condense] '{question}' → '{condensed}'")
+        return condensed
+    except Exception as e:
+        print(f"[Condense] Error: {e}, falling back to original question")
+        return question
+
+
+def summarize_conversation(
+    old_summary: str,
+    overflow_messages: List[Dict[str, str]],
+) -> str:
+    """
+    Summarize overflow messages (pushed out of the sliding window)
+    into a rolling summary that preserves key context.
+
+    Extracts: key topics, important numbers/data, conclusions,
+    and user preferences mentioned in the conversation.
+
+    Args:
+        old_summary: Previous rolling summary (may be empty)
+        overflow_messages: Messages that just fell out of the window
+
+    Returns: Updated summary string
+    """
+    if not overflow_messages:
+        return old_summary
+
+    try:
+        llm = get_llm("summarization")
+
+        msgs_str = "\n".join(
+            f"{msg.get('role', 'user').capitalize()}: {msg.get('content', '')}"
+            for msg in overflow_messages
+        )
+
+        old_block = ""
+        if old_summary:
+            old_block = f"Previous summary:\n{old_summary}\n\n"
+
+        prompt = (
+            "You are maintaining a rolling memory of a research conversation. "
+            "Combine the previous summary with the new messages below into a "
+            "concise updated summary.\n\n"
+            "IMPORTANT — preserve these elements:\n"
+            "- Key topics and concepts discussed\n"
+            "- Important numbers, statistics, and data points\n"
+            "- Conclusions and insights reached\n"
+            "- User's research interests and preferences\n"
+            "- Any specific papers, methods, or terms mentioned\n\n"
+            f"{old_block}"
+            f"New messages to incorporate:\n{msgs_str}\n\n"
+            "Updated summary (keep under 300 words, be concise):"
+        )
+
+        response = llm.invoke(prompt)
+        result = response.content if hasattr(response, 'content') else str(response)
+        new_summary = result.strip() if result and result.strip() else old_summary
+        print(f"[Memory] Summary updated: {len(new_summary)} chars")
+        return new_summary
+    except Exception as e:
+        print(f"[Memory] Summarize failed: {e}, keeping old summary")
+        return old_summary
+
+
+# --- RRF Merge for Multi-Source Retrieval (F1) ---
+
+def rrf_merge(
+    user_docs: List[Document],
+    system_docs: List[Document],
+    k: int = 60,
+    user_boost: float = 1.2,
+    total_k: int = 15,
+) -> List[Document]:
+    """
+    Reciprocal Rank Fusion — merge docs from user paper + system KB.
+
+    Args:
+        user_docs: Documents from user's paper
+        system_docs: Documents from system knowledge base
+        k: RRF constant (higher = more equal weight)
+        user_boost: Boost factor for user docs (>1 = prioritize user paper)
+        total_k: Maximum total docs to return
+
+    Returns:
+        Merged, deduplicated, and ranked list of documents
+    """
+    if not user_docs and not system_docs:
+        return []
+    if not system_docs:
+        return user_docs[:total_k]
+    if not user_docs:
+        return system_docs[:total_k]
+
+    scores: Dict[str, float] = {}
+    doc_map: Dict[str, Document] = {}
+
+    # Score user docs with boost
+    for rank, doc in enumerate(user_docs):
+        content_key = doc.page_content[:100].strip()
+        rrf_score = user_boost / (k + rank + 1)
+        scores[content_key] = scores.get(content_key, 0) + rrf_score
+        doc_map[content_key] = doc
+
+    # Score system docs
+    for rank, doc in enumerate(system_docs):
+        content_key = doc.page_content[:100].strip()
+        rrf_score = 1.0 / (k + rank + 1)
+        scores[content_key] = scores.get(content_key, 0) + rrf_score
+        if content_key not in doc_map:
+            doc_map[content_key] = doc
+
+    # Sort by combined RRF score
+    sorted_keys = sorted(scores.keys(), key=lambda x: scores[x], reverse=True)
+
+    return [doc_map[key] for key in sorted_keys[:total_k]]
 
 
 # Similarity threshold: documents below this are considered irrelevant
@@ -222,13 +547,21 @@ def document_retrieve(
     backend: VectorStoreBackend,
     content_collection: str = CONTENT_COLLECTION,
     k: int = 12,
+    use_hyde: bool = False,
+    include_system_kb: bool = False,
+    kb_categories: List[str] | None = None,
 ) -> List[Document]:
     """
     Chiến lược retrieval tối ưu với similarity threshold:
     1. Nếu là summary: Lấy 1-2 bản ghi Abstract + (k-2) bản ghi Content liên quan nhất.
     2. Nếu là query thường: Lấy k bản ghi tốt nhất từ toàn bộ Store (bao gồm cả Abstract).
     3. Lọc các kết quả có similarity score thấp hơn RELEVANCE_THRESHOLD.
+    4. Nếu use_hyde=True: Transform query bằng HyDE trước khi embed.
+    5. Nếu include_system_kb=True: Song song search system KB, merge bằng RRF.
     """
+    # HyDE transform if enabled
+    effective_query = hyde_transform(query) if use_hyde else query
+
     query_lower = query.lower()
     is_summary = any(x in query_lower for x in ["summary", "overview", "main idea", "summarize", "abstract", "conclusion"])
 
@@ -237,7 +570,7 @@ def document_retrieve(
     if is_summary:
         # PATH A: Lấy Abstract để nắm ý chính
         abstract_docs = backend.similarity_search_with_score(
-            query=query,
+            query=effective_query,
             k=1,
             collection=content_collection,
             where={"$and": [{"paper_id": paper_id}, {"modality": "abstract"}]}
@@ -247,7 +580,7 @@ def document_retrieve(
         # PATH B: Lấy thêm Content để có chi tiết
         search_k = max(8, k - len(results_with_scores))
         content_docs = backend.similarity_search_with_score(
-            query=query,
+            query=effective_query,
             k=search_k,
             collection=content_collection,
             where={"paper_id": paper_id}
@@ -256,7 +589,7 @@ def document_retrieve(
     else:
         # Truy vấn bình thường: Tìm kiếm dựa trên độ tương đồng với scores
         results_with_scores = backend.similarity_search_with_score(
-            query=query,
+            query=effective_query,
             k=k,
             collection=content_collection,
             where={"paper_id": paper_id}
@@ -268,22 +601,51 @@ def document_retrieve(
         if score >= RELEVANCE_THRESHOLD
     ]
 
-    # Tag each document with its relevance score for downstream grounding check
+    # Tag each document with its relevance score
+    user_docs = []
+    seen_content = set()
     for doc, score in filtered:
         if doc.metadata is None:
             doc.metadata = {}
         doc.metadata["relevance_score"] = score
-
-    # Khử trùng lặp dựa trên nội dung
-    seen_content = set()
-    unique_docs = []
-    for doc, score in filtered:
         content_key = doc.page_content[:150].strip()
         if content_key not in seen_content:
-            unique_docs.append(doc)
+            user_docs.append(doc)
             seen_content.add(content_key)
 
-    return unique_docs[:k]
+    # System KB retrieval (if enabled)
+    if include_system_kb:
+        try:
+            kb_where: dict | None = None
+            if kb_categories:
+                if len(kb_categories) == 1:
+                    kb_where = {"category": kb_categories[0]}
+                else:
+                    kb_where = {"category": {"$in": kb_categories}}
+
+            kb_results = backend.similarity_search_with_score(
+                query=effective_query,
+                k=k,
+                collection="system_knowledge_base",
+                where=kb_where,
+            )
+
+            system_docs = []
+            for doc, score in kb_results:
+                if score >= RELEVANCE_THRESHOLD:
+                    if doc.metadata is None:
+                        doc.metadata = {}
+                    doc.metadata["relevance_score"] = score
+                    doc.metadata["source"] = "system"
+                    system_docs.append(doc)
+
+            # Merge using RRF
+            return rrf_merge(user_docs, system_docs, total_k=k)
+        except Exception as e:
+            print(f"[document_retrieve] System KB search failed: {e}")
+            # Fallback to user docs only
+
+    return user_docs[:k]
 
 
 def multi_document_retrieve(

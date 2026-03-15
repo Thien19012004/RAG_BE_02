@@ -619,6 +619,10 @@ def build_semantic_nodes(
         if not paragraphs:
             continue
 
+        # Contextual Chunking: prepend section title for better retrieval
+        resolved_title = section.title or "Untitled Section"
+        section_prefix = f"[Section: {resolved_title}] "
+
         # merge very short paragraphs with previous one
         merged_paras: List[str] = []
         for para in paragraphs:
@@ -640,9 +644,9 @@ def build_semantic_nodes(
                 nodes.append(
                     SemanticNode(
                         paper_id=paper_id,
-                        section_title=section.title or "Untitled Section",
+                        section_title=resolved_title,
                         order_idx=node_counter,
-                        text=para,
+                        text=section_prefix + para,
                         approx_page_start=section.page_start,
                         approx_page_end=section.page_end,
                     )
@@ -683,9 +687,9 @@ def build_semantic_nodes(
                     nodes.append(
                         SemanticNode(
                             paper_id=paper_id,
-                            section_title=section.title or "Untitled Section",
+                            section_title=resolved_title,
                             order_idx=node_counter,
-                            text=" ".join(current_sentences),
+                            text=section_prefix + " ".join(current_sentences),
                             approx_page_start=section.page_start,
                             approx_page_end=section.page_end,
                         )
@@ -703,9 +707,9 @@ def build_semantic_nodes(
                 nodes.append(
                     SemanticNode(
                         paper_id=paper_id,
-                        section_title=section.title or "Untitled Section",
+                        section_title=resolved_title,
                         order_idx=node_counter,
-                        text=" ".join(current_sentences),
+                        text=section_prefix + " ".join(current_sentences),
                         approx_page_start=section.page_start,
                         approx_page_end=section.page_end,
                     )
