@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import datetime as _dt
 import json
-import arxiv  
+import arxiv
 from dataclasses import dataclass, asdict
 from typing import List, Optional
 from difflib import SequenceMatcher
@@ -50,7 +50,7 @@ class ArxivPaper:
 
 class ArxivSearchQuery(BaseModel):
     primary_query: str = Field(
-        ..., 
+        ...,
         description="The optimized search query. prioritizing BROAD CONCEPTS over specific project names."
     )
     explanation: str = Field(..., description="Reasoning.")
@@ -109,7 +109,7 @@ def search_arxiv_raw(query: str, max_results: int = 30) -> List[ArxivPaper]:
         delay_seconds=3.0,
         num_retries=3
     )
-    
+
     # Tìm kiếm
     search = arxiv.Search(
         query=query,
@@ -160,16 +160,16 @@ def rerank_papers_with_llm(
     top_k: int = 5,
     model_name: str = "gpt-4o-mini",
 ) -> List[dict]:
-    
+
     # --- FIX: Lọc bỏ bài báo hiện tại (Self-Hit) ---
     filtered_candidates = []
     for p in candidates:
         if not _is_same_paper(base_title, p.title):
             filtered_candidates.append(p)
-    
+
     if not filtered_candidates:
         return []
-        
+
     llm = ChatOpenAI(model=model_name, temperature=0.1)
 
     prompt = ChatPromptTemplate.from_template(
@@ -194,27 +194,46 @@ CANDIDATES:
             "top_k": top_k,
             "candidates_json": cand_json,
         })
-        
+
         raw = raw.strip().replace("```json", "").replace("```", "")
         data = json.loads(raw)
-        
+
         cleaned: List[dict] = []
-        selected_ids = {item["arxiv_id"]: item.get("reason", "") for item in data.get("results", [])}
-        
+        selected = data.get("results", [])
+
+        # Build mapping arxiv_id -> (reason, rank_index)
+        selected_map = {
+            item["arxiv_id"]: (item.get("reason", ""), idx)
+            for idx, item in enumerate(selected)
+            if "arxiv_id" in item
+        }
+
+        total = max(len(selected_map), 1)
+
         for p in filtered_candidates:
-            if p.arxiv_id in selected_ids:
+            if p.arxiv_id in selected_map:
+                reason, idx = selected_map[p.arxiv_id]
                 d = p.to_public_dict()
-                d["score"] = 1.0 
-                d["reason"] = selected_ids[p.arxiv_id]
+                # Convert rank index -> score in [0,1], 1.0 = best, ~0.7 = worst (for UI % match)
+                if total == 1:
+                    score = 1.0
+                else:
+                    # Higher rank (smaller idx) → higher score
+                    normalized = 1.0 - (idx / (total - 1))
+                    score = 0.7 + normalized * 0.3
+                d["score"] = float(f"{score:.4f}")
+                d["reason"] = reason
                 cleaned.append(d)
-                
+
+        # Ensure results are ordered by score desc
+        cleaned.sort(key=lambda x: x.get("score", 0.0), reverse=True)
         return cleaned[:top_k]
-        
+
     except Exception as e:
         print(f"Rerank Error: {e}")
         # Fallback
         return [
-            {**p.to_public_dict(), "score": 0.0, "reason": "Fallback result"} 
+            {**p.to_public_dict(), "score": 0.0, "reason": "Fallback result"}
             for p in filtered_candidates[:top_k]
         ]
 
@@ -230,26 +249,26 @@ def suggest_related_papers(
     max_results: int = 30,
     top_k: int = 5,
 ) -> List[dict]:
-    
+
     search_query = generate_search_query_with_llm(base_title, base_abstract)
-    
+
     if categories:
         cat_part = " OR ".join(f"cat:{c}" for c in categories)
         search_query = f"({search_query}) AND ({cat_part})"
 
     # Tăng max_results lên để bù cho việc lọc trùng
     raw_papers = search_arxiv_raw(search_query, max_results=max_results + 5)
-    
+
     year_now = _dt.datetime.utcnow().year
     from_year = year_now - 4 if base_title else None
-    
+
     filtered = _filter_by_year(raw_papers, from_year)
-    
+
     ranked = rerank_papers_with_llm(
         base_title=base_title,
         base_abstract=base_abstract,
         candidates=filtered,
         top_k=top_k,
     )
-    
+
     return ranked
