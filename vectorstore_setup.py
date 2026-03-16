@@ -5,6 +5,7 @@ from typing import Any, Dict, List, Optional, Protocol, Tuple
 from langchain_chroma import Chroma
 from langchain_core.documents import Document
 from langchain_openai import OpenAIEmbeddings
+from usage_tracker import track_embedding_usage
 
 DEFAULT_EMBED_MODEL = "text-embedding-3-small"
 # Chỉ còn duy nhất một collection cho toàn bộ nội dung paper
@@ -72,6 +73,12 @@ class LocalChromaBackend:
         where: Optional[Dict[str, Any]] = None,
     ) -> List[Document]:
         store = self._get_store(collection)
+        # Track embedding call
+        track_embedding_usage(
+            model=self.config.embedding_model,
+            provider="openai",
+            num_texts=1,
+        )
         # ChromaDB sử dụng tham số 'filter' cho siêu dữ liệu
         return store.similarity_search(query, k=k, filter=where)
 
@@ -84,6 +91,12 @@ class LocalChromaBackend:
     ) -> List[Tuple[Document, float]]:
         """Search with relevance scores returned."""
         store = self._get_store(collection)
+        # Track embedding call
+        track_embedding_usage(
+            model=self.config.embedding_model,
+            provider="openai",
+            num_texts=1,
+        )
         # ChromaDB returns (doc, score) tuples
         # Note: Chroma returns distance, lower is better. Convert to similarity (higher is better)
         results = store.similarity_search_with_score(query, k=k, filter=where)

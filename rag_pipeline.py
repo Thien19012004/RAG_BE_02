@@ -563,7 +563,7 @@ def document_retrieve(
     effective_query = hyde_transform(query) if use_hyde else query
 
     query_lower = query.lower()
-    is_summary = any(x in query_lower for x in ["summary", "overview", "main idea", "summarize", "abstract", "conclusion"])
+    is_summary = any(x in query_lower for x in ["summary", "overview", "main idea", "summarize", "abstract", "conclusion", "contribution"])
 
     results_with_scores: List[tuple] = []
 

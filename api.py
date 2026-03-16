@@ -11,6 +11,9 @@ import uuid
 from pathlib import Path
 from typing import Optional, Dict, Any, List
 
+from model_factory import get_system_config
+from usage_tracker import start_tracking, stop_tracking
+
 from fastapi import FastAPI, File, UploadFile, HTTPException, Form, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -87,9 +90,71 @@ class QueryRequest(BaseModel):
     custom_prompts: Optional[Dict[str, str]] = None  # {rag_instructions, condense_question}
 
 
+class LlmUsageEntry(BaseModel):
+    """Token usage info for a single LLM call."""
+    model: str = ""
+    provider: str = ""
+    purpose: str = ""
+    input_tokens: int = 0
+    output_tokens: int = 0
+
+
+def extract_usage(response: Any, purpose: str = "generation") -> Optional[LlmUsageEntry]:
+    """Extract token usage from a LangChain response object."""
+    try:
+        # LangChain AIMessage has usage_metadata
+        meta = getattr(response, 'usage_metadata', None)
+        if meta is None:
+            # Try response_metadata dict
+            resp_meta = getattr(response, 'response_metadata', {})
+            meta = resp_meta.get('usage_metadata') or resp_meta.get('token_usage')
+        if meta is None:
+            return None
+
+        # Determine model/provider from config or response
+        resp_meta = getattr(response, 'response_metadata', {}) or {}
+        model_name = resp_meta.get('model_name', '') or resp_meta.get('model', '')
+        # Infer provider from model name
+        provider = 'unknown'
+        if 'gpt' in model_name.lower() or 'openai' in model_name.lower():
+            provider = 'openai'
+        elif 'llama' in model_name.lower() or 'groq' in model_name.lower():
+            provider = 'groq'
+        elif 'gemini' in model_name.lower():
+            provider = 'gemini'
+
+        # If model_name not in response, try reading from config
+        if not model_name:
+            config_key = f"llm.{purpose}"
+            cfg = get_system_config(config_key)
+            model_name = cfg.get('model', 'unknown')
+            provider = cfg.get('provider', 'unknown')
+
+        input_tokens = 0
+        output_tokens = 0
+        if isinstance(meta, dict):
+            input_tokens = meta.get('input_tokens', 0) or meta.get('prompt_tokens', 0) or 0
+            output_tokens = meta.get('output_tokens', 0) or meta.get('completion_tokens', 0) or 0
+        else:
+            input_tokens = getattr(meta, 'input_tokens', 0) or 0
+            output_tokens = getattr(meta, 'output_tokens', 0) or 0
+
+        return LlmUsageEntry(
+            model=model_name,
+            provider=provider,
+            purpose=purpose,
+            input_tokens=int(input_tokens),
+            output_tokens=int(output_tokens),
+        )
+    except Exception as e:
+        print(f"[extract_usage] Error: {e}")
+        return None
+
+
 class QueryResponse(BaseModel):
     answer: str
     context: Optional[dict] = None
+    usage: Optional[List[LlmUsageEntry]] = None
 
 
 class ExplainRequest(BaseModel):
@@ -183,6 +248,7 @@ class MultiQueryResponse(BaseModel):
     answer: str
     context: Optional[dict] = None
     sources: Optional[List[dict]] = None  # Which papers contributed to the answer
+    usage: Optional[List[LlmUsageEntry]] = None
 
 # -----------------------------------------------------------------------------
 # Helpers
@@ -361,7 +427,9 @@ async def query_pdf(req: QueryRequest):
             system_instructions=custom_prompts["rag_instructions"],
         )
         chain = build_document_rag_chain(req.file_id, VECTOR_BACKEND, custom_prompt_cfg)
-        # Don't cache custom chains — rebuild each time
+
+    # Start token tracking
+    start_tracking()
 
     # Condense follow-up question using chat history + rolling summary
     effective_question = req.question
@@ -374,8 +442,28 @@ async def query_pdf(req: QueryRequest):
         )
 
     out = chain.invoke({"question": effective_question})
-    # rag_pipeline trả {"response": answer, "context": ctx}
-    return QueryResponse(answer=out["response"], context=out.get("context"))
+
+    # Collect tracked usage
+    tracked = stop_tracking()
+    usage_entries = []
+    if tracked:
+        usage_entries = [
+            LlmUsageEntry(
+                model=r.model,
+                provider=r.provider,
+                purpose=r.purpose,
+                input_tokens=r.input_tokens,
+                output_tokens=r.output_tokens,
+            )
+            for r in tracked.records
+        ]
+
+    return QueryResponse(
+        answer=out["response"],
+        context=out.get("context"),
+        usage=usage_entries if usage_entries else None,
+    )
+
 
 
 # --- Summarize Memory (Rolling Summary) ---
@@ -385,12 +473,24 @@ class SummarizeMemoryRequest(BaseModel):
 
 class SummarizeMemoryResponse(BaseModel):
     summary: str
+    usage: Optional[List[LlmUsageEntry]] = None
 
 @app.post("/summarize-memory", response_model=SummarizeMemoryResponse)
 async def summarize_memory(req: SummarizeMemoryRequest):
     """Summarize overflow messages for rolling conversation memory."""
+    start_tracking()
     result = summarize_conversation(req.old_summary, req.messages)
-    return SummarizeMemoryResponse(summary=result)
+    tracked = stop_tracking()
+    usage = []
+    if tracked:
+        usage = [
+            LlmUsageEntry(
+                model=r.model, provider=r.provider, purpose=r.purpose,
+                input_tokens=r.input_tokens, output_tokens=r.output_tokens,
+            )
+            for r in tracked.records
+        ]
+    return SummarizeMemoryResponse(summary=result, usage=usage if usage else None)
 
 
 # new endpoint for general AI text generation without paper context
@@ -438,6 +538,9 @@ async def query_multi_pdf(req: MultiQueryRequest):
 
     if len(req.file_ids) > 10:
         raise HTTPException(400, "Maximum 10 papers can be queried at once")
+
+    # Start token tracking for all LLM calls in this request
+    start_tracking()
 
     # Validate all files are ready and load metadata
     paper_titles = {}
@@ -611,10 +714,23 @@ async def query_multi_pdf(req: MultiQueryRequest):
                 "title": paper_titles.get(paper_id, f"Paper {paper_id[:8]}"),
             })
 
+    # Collect tracked usage
+    tracked = stop_tracking()
+    multi_usage = []
+    if tracked:
+        multi_usage = [
+            LlmUsageEntry(
+                model=r.model, provider=r.provider, purpose=r.purpose,
+                input_tokens=r.input_tokens, output_tokens=r.output_tokens,
+            )
+            for r in tracked.records
+        ]
+
     return MultiQueryResponse(
         answer=answer,
         context=context,
         sources=sources,
+        usage=multi_usage if multi_usage else None,
     )
 
 

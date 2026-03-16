@@ -93,34 +93,38 @@ def get_llm(purpose: str) -> BaseChatModel:
 
     Returns:
         A LangChain BaseChatModel instance configured per system settings.
+        Includes TokenTrackingCallback for automatic usage tracking.
     """
+    from usage_tracker import TokenTrackingCallback
+
     config = get_system_config(f"llm.{purpose}")
     provider = config.get("provider", "openai")
     model = config.get("model", "gpt-4o-mini")
     temperature = config.get("temperature", 0.2)
+    callbacks = [TokenTrackingCallback(model=model, provider=provider, purpose=purpose)]
 
     if provider == "openai":
         from langchain_openai import ChatOpenAI
-        return ChatOpenAI(model=model, temperature=temperature)
+        return ChatOpenAI(model=model, temperature=temperature, callbacks=callbacks)
 
     elif provider == "groq":
         from langchain_groq import ChatGroq
-        return ChatGroq(model=model, temperature=temperature)
+        return ChatGroq(model=model, temperature=temperature, callbacks=callbacks)
 
     elif provider == "gemini":
         try:
             from langchain_google_genai import ChatGoogleGenerativeAI
-            return ChatGoogleGenerativeAI(model=model, temperature=temperature)
+            return ChatGoogleGenerativeAI(model=model, temperature=temperature, callbacks=callbacks)
         except ImportError:
             print("[model_factory] langchain-google-genai not installed, falling back to OpenAI")
             from langchain_openai import ChatOpenAI
-            return ChatOpenAI(model="gpt-4o-mini", temperature=temperature)
+            return ChatOpenAI(model="gpt-4o-mini", temperature=temperature, callbacks=callbacks)
 
     else:
         # Unknown provider → fallback to OpenAI
         print(f"[model_factory] Unknown provider '{provider}', falling back to OpenAI")
         from langchain_openai import ChatOpenAI
-        return ChatOpenAI(model="gpt-4o-mini", temperature=temperature)
+        return ChatOpenAI(model="gpt-4o-mini", temperature=temperature, callbacks=callbacks)
 
 
 def invalidate_cache() -> None:
